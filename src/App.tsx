@@ -26,7 +26,12 @@ import {
 import { motion, AnimatePresence } from "motion/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { GoogleGenAI } from "@google/genai";
+import * as pdfjsLib from 'pdfjs-dist';
 import { cn } from "./lib/utils";
+
+// Worker configuration for pdfjs
+pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 
 // Firebase Imports
 import { initializeApp } from "firebase/app";
@@ -39,6 +44,11 @@ const auth = getAuth(app);
 const provider = new GoogleAuthProvider();
 
 const AUTHORIZED_EMAIL = "ketan.thaker@gmail.com";
+
+// Initialize Gemini on Frontend (Safe Access)
+const AI_MODEL = "gemini-1.5-flash";
+const aiKey = process.env.GEMINI_API_KEY || "";
+const ai = aiKey ? new GoogleGenAI({ apiKey: aiKey }) : null;
 
 interface AuditLogEntry {
   filename: string;
@@ -99,6 +109,10 @@ export default function App() {
 
   const processFiles = async () => {
     if (files.length === 0 || !user) return;
+    if (!ai) {
+      setError("AI Engine initialization failed: GEMINI_API_KEY is missing from the browser environment secrets.");
+      return;
+    }
     
     setIsProcessing(true);
     setError(null);
@@ -109,50 +123,76 @@ export default function App() {
     let summary = { totalFiles: files.length, processed: 0, skipped: 0, errors: 0 };
 
     try {
-      const idToken = await user.getIdToken();
-
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
         setProcessingStatus({ current: i + 1, total: files.length, fileName: file.name });
 
-        const formData = new FormData();
-        formData.append("files", file);
+        try {
+          const contentType = file.type;
+          const isPdf = contentType === "application/pdf";
+          const isText = contentType.includes("text") || file.name.endsWith(".txt");
+          
+          let extractedContent = "";
+          let rawTextForQA = "";
 
-        const response = await fetch("/api/process", {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${idToken}`
-          },
-          body: formData,
-        });
+          // 1. Local Triage & Extraction (Browser-Friendly)
+          if (isPdf) {
+            const arrayBuffer = await file.arrayBuffer();
+            const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+            let fullText = "";
+            for (let p = 1; p <= pdfDoc.numPages; p++) {
+              const page = await pdfDoc.getPage(p);
+              const textContent = await page.getTextContent();
+              fullText += textContent.items.map((item: any) => (item as any).str).join(" ") + "\n";
+            }
+            rawTextForQA = fullText;
+          } else if (isText) {
+            rawTextForQA = await file.text();
+          }
 
-        const contentType = response.headers.get("content-type");
-        if (!contentType || !contentType.includes("application/json")) {
-          throw new Error(`Server Error (${response.status}) on file ${file.name}.`);
-        }
+          // 2. Gemini Multi-Modal Extraction
+          const base64 = await new Promise<string>((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve((reader.result as string).split(",")[1]);
+            reader.readAsDataURL(file);
+          });
 
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || `Failed on ${file.name}`);
+          const prompt = `Extract high-fidelity financial data from ${file.name}.
+          RULES:
+          1. Start with YAML (ticker, company_name, doc_date, doc_type, extraction_confidence).
+          2. Convert tables to GFM Markdown. 
+          3. Preserve footnotes, units, currency symbols.
+          4. Output ONLY Markdown.`;
 
-        // Merge results
-        const dossierContent = (data.dossier || "").replace(/# Master Research Dossier[\s\S]*?Generated on:.*?\n\n/, "");
-        combinedDossier += (combinedDossier ? "\n\n" : "# Master Research Dossier\n\n") + dossierContent;
-        
-        if (data.auditLog && Array.isArray(data.auditLog)) {
-          combinedAuditLog = [...combinedAuditLog, ...data.auditLog];
-        }
+          const parts = [
+            { inlineData: { mimeType: isPdf ? "application/pdf" : "text/plain", data: base64 } },
+            { text: prompt }
+          ];
 
-        if (data.summary) {
-          summary.processed += (data.summary.processed || 0);
-          summary.skipped += (data.summary.skipped || 0);
-          summary.errors += (data.summary.errors || 0);
+          const response = await ai.models.generateContent({
+             model: AI_MODEL,
+             contents: [{ role: "user", parts }]
+          });
+
+          extractedContent = response.text || "No content extracted";
+          
+          // 3. Automated QA
+          const qa = runQA(rawTextForQA || extractedContent, extractedContent);
+          
+          combinedDossier += (combinedDossier ? "\n\n" : "# Master Research Dossier\n\nGenerated: " + new Date().toISOString() + "\n\n") + `## Section: ${file.name}\n\n${extractedContent}\n\n---\n`;
+          combinedAuditLog.push({ filename: file.name, status: "processed", qa: qa.status });
+          summary.processed++;
+
+        } catch (fileErr: any) {
+          console.error(`Error processing ${file.name}:`, fileErr);
+          combinedAuditLog.push({ filename: file.name, status: "error", error: fileErr.message });
+          summary.errors++;
         }
       }
 
       setResult({ dossier: combinedDossier, auditLog: combinedAuditLog, summary });
     } catch (err: any) {
-      console.error("Batch processing error:", err);
-      setError(err.message || "An unexpected error occurred.");
+      setError(err.message || "Batch process failed.");
     } finally {
       setIsProcessing(false);
       setProcessingStatus(null);
