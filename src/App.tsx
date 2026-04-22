@@ -46,6 +46,7 @@ interface AuditLogEntry {
   reason?: string;
   score?: number;
   error?: string;
+  qa?: string;
 }
 
 interface ProcessResponse {
@@ -526,6 +527,7 @@ export default function App() {
                       <tr className="border-b border-slate-100 text-[10px] font-bold text-slate-400 uppercase tracking-widest bg-slate-50/30">
                         <th className="p-5 font-bold">Document</th>
                         <th className="p-5 font-bold">Protocol Status</th>
+                        <th className="p-5 font-bold">QA Status</th>
                         <th className="p-5 font-bold">Run Details</th>
                       </tr>
                     </thead>
@@ -546,8 +548,16 @@ export default function App() {
                               {entry.status}
                             </span>
                           </td>
+                          <td className="p-5">
+                              <span className={cn(
+                                "text-[10px] font-bold italic",
+                                entry.qa?.includes("Failed") ? "text-red-500" : "text-slate-500"
+                              )}>
+                                {entry.qa || "N/A"}
+                              </span>
+                          </td>
                           <td className="p-5 text-slate-500 font-medium italic">
-                            {entry.reason || entry.error || (entry.score ? `Conf Score: ${entry.score}` : 'Successful extraction')}
+                            {entry.reason || entry.error || (entry.score ? `Triage Score: ${entry.score}` : 'Successful extraction')}
                           </td>
                         </tr>
                       ))}

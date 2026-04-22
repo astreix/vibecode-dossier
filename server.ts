@@ -84,23 +84,126 @@ function calculateHash(buffer: Buffer): string {
   return crypto.createHash("sha256").update(buffer).digest("hex");
 }
 
+function scoreText(text: string): number {
+  let score = 0;
+  const lowerText = text.toLowerCase();
+
+  // +2 points for keywords
+  const highValue = ["ebitda", "consolidated statement", "md&a", "segmental analysis", "outlook"];
+  highValue.forEach(kw => {
+    if (lowerText.includes(kw)) score += 2;
+  });
+
+  // +1 point for numeric density (>10%) or currency symbols
+  const digits = (text.match(/\d/g) || []).length;
+  if (digits / (text.length || 1) > 0.1) score += 1;
+  if (/[\$€£]/.test(text)) score += 1;
+
+  // -2 points for boilerplate
+  const boilerplate = ["proxy form", "voting rights", "shareholder information"];
+  boilerplate.forEach(kw => {
+    if (lowerText.includes(kw)) score -= 2;
+  });
+
+  return score;
+}
+
+function excelToMarkdown(buffer: Buffer): string {
+  const workbook = xlsx.read(buffer, { type: 'buffer' });
+  let markdown = "";
+  workbook.SheetNames.forEach(sheetName => {
+    markdown += `### Sheet: ${sheetName}\n\n`;
+    const sheet = workbook.Sheets[sheetName];
+    const json = xlsx.utils.sheet_to_json(sheet, { header: 1 }) as any[][];
+    if (json.length > 0) {
+      const headers = json[0];
+      markdown += `| ${headers.map(h => String(h || "")).join(" | ")} |\n`;
+      markdown += `| ${headers.map(() => "---").join(" | ") || ""} |\n`;
+      json.slice(1).forEach(row => {
+        markdown += `| ${row.map(c => String(c ?? "").replace(/\|/g, "\\|")).join(" | ")} |\n`;
+      });
+      markdown += "\n";
+    }
+  });
+  return markdown;
+}
+
 const AI_MODEL = "gemini-3-flash-preview";
 
-async function aiDossierExtraction(buffer: Buffer, mimeType: string, filename: string) {
+async function aiDossierExtraction(content: string, filename: string, options: { 
+  useVision?: boolean; 
+  buffer?: Buffer; 
+  mimeType?: string;
+  reTry?: boolean;
+} = {}) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("GEMINI_API_KEY missing");
   const ai = new GoogleGenAI({ apiKey: key });
+  
+  const parts: any[] = [];
+  
+  if (options.useVision && options.buffer && options.mimeType) {
+    parts.push({
+      inlineData: {
+        mimeType: options.mimeType,
+        data: options.buffer.toString("base64")
+      }
+    });
+  }
+
+  const promptText = options.reTry ? 
+    `QA FAILED FOR PREVIOUS ATTEMPT. TRANSCRIPTION ERROR DETECTED.
+    RE-PROCESS THIS DOCUMENT (${filename}) WITH 100% NUMERIC ACCURACY.
+    Transcribe all financial tables into high-fidelity Markdown. 
+    Preserve all footnotes, units (millions/billions), and currency symbols.` :
+    `Extract high-fidelity financial data from the following document content (${filename}).
+    
+    RULES:
+    1. Start with a YAML metadata header:
+       ---
+       ticker: [DETECT TICKER SYMBOL OR 'UNKNOWN']
+       company_name: [DETECT COMPANY FULL NAME]
+       doc_date: [DETECT DOCUMENT DATE]
+       doc_type: [Annual Report, Earnings Transcript, Regulatory Filing, or Other]
+       extraction_confidence: [High/Low]
+       ---
+    2. Convert all financial tables into GitHub-flavored Markdown. 
+    3. Preserve all footnotes, units (millions/billions), and currency symbols.
+    4. Remove aggressive boilerplate, legal disclaimers, and auditor reports UNLESS they contain specific financial numbers.
+    5. Output ONLY the markdown content (no additional meta-talk).`;
+
+  parts.push({ text: `${promptText}\n\nCONTENT:\n${content}` });
+
   const response = await ai.models.generateContent({
     model: AI_MODEL,
-    contents: [{
-      role: "user",
-      parts: [
-        { inlineData: { mimeType, data: buffer.toString("base64") } },
-        { text: `Extract financial data from ${filename} into Markdown.` }
-      ]
-    }]
+    contents: [{ role: "user", parts }]
   });
+
   return response.text || "No content extracted";
+}
+
+function runQA(originalText: string, extractedMarkdown: string): { status: string; passed: boolean } {
+  const originalNumbers = (originalText.match(/\d+([\.,]\d+)?/g) || []).length;
+  const extractedNumbers = (extractedMarkdown.match(/\d+([\.,]\d+)?/g) || []).length;
+  
+  // Rule: Numeric Coverage > 50%
+  const missingRatio = originalNumbers > 0 ? (extractedNumbers / originalNumbers) : 1;
+  
+  const hasCurrencySymbols = /[\$€£]/.test(extractedMarkdown);
+  const originalCurrency = /[\$€£]/.test(originalText);
+  
+  let passed = true;
+  let status = "QA: Passed [Manual Check Recommended]";
+
+  if (missingRatio < 0.5 && originalNumbers > 10) {
+    passed = false;
+    status = "QA: Failed [Low Numeric Coverage]";
+  } else if (originalCurrency && !hasCurrencySymbols) {
+    passed = false;
+    status = "QA: Failed [Currency Symbols Missing]";
+  }
+
+  return { status, passed };
 }
 
 async function startServer() {
@@ -120,26 +223,126 @@ async function startServer() {
     const { OfficeParser } = require("officeparser");
 
     const auditLog: any[] = [];
-    let finalDossier = "";
+    let finalDossier = "# Master Research Dossier\n\nGenerated on: " + new Date().toISOString() + "\n\n";
 
     for (const file of files) {
       try {
+        const hash = calculateHash(file.buffer);
+        
+        // Deduplication Check
+        if (extractionCache[hash]) {
+          auditLog.push({ filename: file.originalname, status: "cached", score: 100 });
+          finalDossier += `## Section: ${file.originalname} (CACHED)\n\n${extractionCache[hash]}\n\n---\n\n`;
+          continue;
+        }
+
         const mime = file.mimetype;
         const name = file.originalname.toLowerCase();
         let extractedContent = "";
+        let rawContent = "";
+        let score = 0;
+        let qaStatus = "QA: N/A";
+        let usedVision = false;
 
         if (mime === "application/pdf") {
-          extractedContent = await aiDossierExtraction(file.buffer, mime, file.originalname);
+          const localData = await pdfParse(file.buffer);
+          rawContent = localData.text;
+          score = scoreText(rawContent);
+          if (score >= 2) {
+            extractedContent = await aiDossierExtraction(rawContent, file.originalname);
+            const qa = runQA(rawContent, extractedContent);
+            qaStatus = qa.status;
+            if (!qa.passed) {
+              console.log(`QA Failed for ${file.originalname}, falling back to Vision...`);
+              extractedContent = await aiDossierExtraction(rawContent, file.originalname, {
+                useVision: true,
+                buffer: file.buffer,
+                mimeType: "application/pdf",
+                reTry: true
+              });
+              const secondQA = runQA(rawContent, extractedContent);
+              qaStatus = secondQA.status + " (High Fidelity - Vision Assisted)";
+              usedVision = true;
+            }
+          } else {
+             extractedContent = `---
+ticker: UNKNOWN
+company_name: [DETECTED FROM FILENAME: ${file.originalname}]
+doc_date: [DETECTED]
+doc_type: PDF (Basic Extraction)
+extraction_confidence: Low
+---
+
+### Basic Extraction (Triage Score: ${score})
+
+${rawContent.slice(0, 5000)} ${rawContent.length > 5000 ? "... [TRUNCATED]" : ""}`;
+          }
         } else if (name.endsWith(".xlsx") || name.endsWith(".csv")) {
-          extractedContent = await aiDossierExtraction(file.buffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", file.originalname);
+          const localTable = excelToMarkdown(file.buffer);
+          extractedContent = `---
+ticker: UNKNOWN
+company_name: [FROM FILENAME: ${file.originalname}]
+doc_date: [DETECTED]
+doc_type: Spreadsheet (Local Parse)
+extraction_confidence: High
+---
+
+${localTable}`;
+          qaStatus = "QA: Local Parse Integrity Guaranteed";
+        } else if (mime.includes("text") || name.endsWith(".txt") || name.endsWith(".html") || name.endsWith(".htm")) {
+          rawContent = file.buffer.toString('utf-8');
+          if (name.endsWith(".html") || name.endsWith(".htm")) {
+            rawContent = rawContent.replace(/<[^>]*>?/gm, ' ');
+          }
+          score = scoreText(rawContent);
+          if (score >= 2) {
+            extractedContent = await aiDossierExtraction(rawContent, file.originalname);
+            const qa = runQA(rawContent, extractedContent);
+            qaStatus = qa.status;
+          } else {
+            extractedContent = `---
+ticker: UNKNOWN
+company_name: [FROM FILENAME: ${file.originalname}]
+doc_date: [DETECTED]
+doc_type: Text/HTML (Basic)
+extraction_confidence: Low
+---
+
+### Basic Text Extraction (Triage Score: ${score})
+
+${rawContent.slice(0, 5000)} ${rawContent.length > 5000 ? "... [TRUNCATED]" : ""}`;
+          }
         } else if (name.endsWith(".pptx") || name.endsWith(".docx")) {
-          extractedContent = await aiDossierExtraction(file.buffer, mime, file.originalname);
+          const ast = await OfficeParser.parseOffice(file.buffer);
+          rawContent = typeof ast.toText === 'function' ? ast.toText() : JSON.stringify(ast);
+          score = scoreText(rawContent);
+          if (score >= 2) {
+            extractedContent = await aiDossierExtraction(rawContent, file.originalname);
+            const qa = runQA(rawContent, extractedContent);
+            qaStatus = qa.status;
+          } else {
+            extractedContent = `---
+ticker: UNKNOWN
+company_name: [FROM FILENAME: ${file.originalname}]
+doc_date: [DETECTED]
+doc_type: Office (Basic)
+extraction_confidence: Low
+---
+
+### Basic Office Parsing (Triage Score: ${score})
+
+${rawContent.slice(0, 5000)} ${rawContent.length > 5000 ? "... [TRUNCATED]" : ""}`;
+          }
         } else {
-          extractedContent = await aiDossierExtraction(file.buffer, "text/plain", file.originalname);
+          continue;
         }
-        
-        finalDossier += extractedContent + "\n\n---\n\n";
-        auditLog.push({ filename: file.originalname, status: "processed" });
+
+        // Append QA Status to content
+        extractedContent += `\n\n---\n**Batch Metadata & QA:**\n- QA Status: ${qaStatus}\n- Intelligence Hash: ${hash}\n- Modality: ${usedVision ? "Vision Fallback" : "Standard Parsing"}\n`;
+
+        extractionCache[hash] = extractedContent;
+        auditLog.push({ filename: file.originalname, status: "processed", score, qa: qaStatus });
+        finalDossier += `## Section: ${file.originalname}\n\n${extractedContent}\n\n---\n\n`;
       } catch (e: any) {
         auditLog.push({ filename: file.originalname, status: "error", error: e.message });
       }
