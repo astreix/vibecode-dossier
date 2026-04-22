@@ -42,7 +42,7 @@ const provider = new GoogleAuthProvider();
 const AUTHORIZED_EMAIL = "ketan.thaker@gmail.com";
 
 // Initialize Gemini on Frontend (Safe Access)
-const AI_MODEL = "gemini-3-flash-preview";
+const AI_MODEL = "gemini-2.5-flash-lite";
 const aiKey = process.env.GEMINI_API_KEY || "";
 const ai = aiKey ? new GoogleGenAI({ apiKey: aiKey }) : null;
 
@@ -126,41 +126,44 @@ export default function App() {
         try {
           const contentType = file.type;
           const isPdf = contentType === "application/pdf";
+          const isTxt = file.name.endsWith(".txt") || contentType === "text/plain";
           
           let extractedContent = "";
-          let rawTextForQA = "";
 
-          // 1. Native Gemini Extraction (Passing File Directly)
-          const base64 = await new Promise<string>((resolve) => {
-            const reader = new FileReader();
-            reader.onloadend = () => resolve((reader.result as string).split(",")[1]);
-            reader.readAsDataURL(file);
-          });
+          if (isTxt) {
+            // Bypass logic for transcripts: read verbatim
+            extractedContent = await file.text();
+            combinedAuditLog.push({ filename: file.name, status: "processed", qa: "Verbatim Import" });
+          } else {
+            // 1. Native Gemini Extraction (Passing File Directly)
+            const base64 = await new Promise<string>((resolve) => {
+              const reader = new FileReader();
+              reader.onloadend = () => resolve((reader.result as string).split(",")[1]);
+              reader.readAsDataURL(file);
+            });
 
-          const prompt = `Extract high-fidelity financial data from ${file.name}.
-          RULES:
-          1. Start with YAML (ticker, company_name, doc_date, doc_type, extraction_confidence).
-          2. Convert tables to GFM Markdown. 
-          3. Preserve footnotes, units, currency symbols.
-          4. Output ONLY Markdown.`;
+            const prompt = `Extract high-fidelity financial data from ${file.name}.
+            RULES:
+            1. Start with YAML (ticker, company_name, doc_date, doc_type, extraction_confidence).
+            2. Convert tables to GFM Markdown. 
+            3. Preserve footnotes, units, currency symbols.
+            4. Output ONLY Markdown.`;
 
-          const parts = [
-            { inlineData: { mimeType: contentType || "application/octet-stream", data: base64 } },
-            { text: prompt }
-          ];
+            const parts = [
+              { inlineData: { mimeType: contentType || "application/octet-stream", data: base64 } },
+              { text: prompt }
+            ];
 
-          const response = await ai.models.generateContent({
-             model: AI_MODEL,
-             contents: [{ role: "user", parts }]
-          });
+            const response = await ai.models.generateContent({
+              model: AI_MODEL,
+              contents: [{ role: "user", parts }]
+            });
 
-          extractedContent = response.text || "No content extracted";
-          
-          // 2. Automated QA (Gemini is the Source of Truth here)
-          const qa = { status: "AI Processed", passed: true };
+            extractedContent = response.text || "No content extracted";
+            combinedAuditLog.push({ filename: file.name, status: "processed", qa: "AI Processed" });
+          }
           
           combinedDossier += (combinedDossier ? "\n\n" : "# Master Research Dossier\n\nGenerated: " + new Date().toISOString() + "\n\n") + `## Section: ${file.name}\n\n${extractedContent}\n\n---\n`;
-          combinedAuditLog.push({ filename: file.name, status: "processed", qa: qa.status });
           summary.processed++;
 
         } catch (fileErr: any) {
