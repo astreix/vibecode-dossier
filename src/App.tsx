@@ -59,6 +59,7 @@ interface AuditLogEntry {
   score?: number;
   error?: string;
   qa?: string;
+  tokens?: { prompt: number; candidates: number };
 }
 
 interface ProcessResponse {
@@ -69,6 +70,7 @@ interface ProcessResponse {
     processed: number;
     skipped: number;
     errors: number;
+    cost: number;
   };
 }
 
@@ -77,11 +79,17 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [files, setFiles] = useState<File[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [processingStatus, setProcessingStatus] = useState<{ current: number; total: number; fileName: string } | null>(null);
+  const [processingStatus, setProcessingStatus] = useState<{ 
+    current: number; 
+    total: number; 
+    fileName: string;
+    pdfPages?: { current: number; total: number };
+  } | null>(null);
   const [result, setResult] = useState<ProcessResponse | null>(null);
   const [scoutThreshold, setScoutThreshold] = useState(82);
   const [ageFilter, setAgeFilter] = useState(3);
   const [ticker, setTicker] = useState("");
+  const [totalCost, setTotalCost] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -120,10 +128,15 @@ export default function App() {
     setIsProcessing(true);
     setError(null);
     setResult(null);
+    setTotalCost(0);
 
     let combinedDossier = "";
     let combinedAuditLog: AuditLogEntry[] = [];
-    let summary = { totalFiles: files.length, processed: 0, skipped: 0, errors: 0 };
+    let summary = { totalFiles: files.length, processed: 0, skipped: 0, errors: 0, cost: 0 };
+    let runningCost = 0;
+
+    const FLASH_LITE_IN = 0.000000075;
+    const FLASH_LITE_OUT = 0.0000003;
 
     try {
       for (let i = 0; i < files.length; i++) {
@@ -144,13 +157,18 @@ export default function App() {
           } else if (isPdf) {
             // 1. Local Extraction Attempt (Main Thread)
             let localText = "";
+            let pageCount = 0;
             try {
               const arrayBuffer = await file.arrayBuffer();
               const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer, verbosity: 0 });
               const pdf = await loadingTask.promise;
+              pageCount = pdf.numPages;
+              setProcessingStatus(prev => prev ? { ...prev, pdfPages: { current: 0, total: pageCount } } : null);
+              
               let fullText = "";
               // Extract all pages locally to see if it's text-searchable
               for (let p = 1; p <= pdf.numPages; p++) {
+                setProcessingStatus(prev => prev ? { ...prev, pdfPages: { current: p, total: pageCount } } : null);
                 const page = await pdf.getPage(p);
                 const textContent = await page.getTextContent();
                 fullText += textContent.items.map((item: any) => item.str).join(" ") + " ";
@@ -168,19 +186,20 @@ export default function App() {
               // 2. Smart Scout Fallback (Gemini API with Page Limits)
               const arrayBuffer = await file.arrayBuffer();
               const srcDoc = await PDFDocument.load(arrayBuffer);
-              const pageCount = srcDoc.getPageCount();
+              const totalPagesAtGemini = srcDoc.getPageCount();
+              setProcessingStatus(prev => prev ? { ...prev, pdfPages: { current: 0, total: totalPagesAtGemini } } : null);
               
               let finalBuffer: Uint8Array;
               let note = "";
 
-              if (pageCount > 10) {
+              if (totalPagesAtGemini > 10) {
                 // Slice to first 10 pages for cost optimization
                 const newDoc = await PDFDocument.create();
                 const pagesToCopy = Array.from({ length: 10 }, (_, idx) => idx);
                 const copiedPages = await newDoc.copyPages(srcDoc, pagesToCopy);
                 copiedPages.forEach(p => newDoc.addPage(p));
                 finalBuffer = await newDoc.save();
-                note = `\n\n[Smart Scout Notice: Document was ${pageCount} pages. Clipped to first 10 pages for cost optimization.]`;
+                note = `\n\n[Smart Scout Notice: Document was ${totalPagesAtGemini} pages. Clipped to first 10 pages for cost optimization.]`;
               } else {
                 finalBuffer = new Uint8Array(arrayBuffer);
               }
@@ -207,7 +226,22 @@ export default function App() {
               });
 
               extractedContent = (response.text || "No content extracted") + note;
-              combinedAuditLog.push({ filename: file.name, status: "processed", qa: `AI Processed (${pageCount > 10 ? 'Clipped' : 'Full'})` });
+              
+              // Tracking Token Usage & Cost
+              if (response.usageMetadata) {
+                const { promptTokenCount = 0, candidatesTokenCount = 0 } = response.usageMetadata;
+                const fileCost = (promptTokenCount * FLASH_LITE_IN) + (candidatesTokenCount * FLASH_LITE_OUT);
+                runningCost += fileCost;
+                setTotalCost(runningCost);
+                combinedAuditLog.push({ 
+                  filename: file.name, 
+                  status: "processed", 
+                  qa: `AI Processed (${totalPagesAtGemini > 10 ? 'Clipped' : 'Full'})`,
+                  tokens: { prompt: promptTokenCount, candidates: candidatesTokenCount }
+                });
+              } else {
+                combinedAuditLog.push({ filename: file.name, status: "processed", qa: `AI Processed (${totalPagesAtGemini > 10 ? 'Clipped' : 'Full'})` });
+              }
             }
           } else {
             // Non-PDF/Text fallback
@@ -227,6 +261,7 @@ export default function App() {
         }
       }
 
+      summary.cost = runningCost;
       setResult({ dossier: combinedDossier, auditLog: combinedAuditLog, summary });
     } catch (err: any) {
       setError(err.message || "Batch process failed.");
@@ -439,8 +474,8 @@ export default function App() {
                 <div className="text-lg font-bold text-slate-800">84.2%</div>
               </div>
               <div className="p-3 bg-slate-50 border border-slate-100 rounded-lg">
-                <div className="text-[10px] text-slate-400 uppercase font-bold mb-1">API Usage</div>
-                <div className="text-lg font-bold text-slate-800">2.4k</div>
+                <div className="text-[10px] text-slate-400 uppercase font-bold mb-1">API Cost (Est)</div>
+                <div className="text-lg font-bold text-blue-600">${totalCost.toFixed(5)}</div>
               </div>
             </div>
           </section>
@@ -590,9 +625,11 @@ export default function App() {
                     />
                   </div>
                   
-                  <div className="flex justify-between text-[10px] font-bold uppercase tracking-[0.2em] text-slate-400">
-                    <span>Document {processingStatus.current} of {processingStatus.total}</span>
-                    <span className="animate-pulse">Active Protocol</span>
+                  <div className="flex justify-between text-[11px] font-bold uppercase tracking-[0.2em] text-slate-400">
+                    <span>File {processingStatus.current} of {processingStatus.total}</span>
+                    {processingStatus.pdfPages && (
+                      <span className="text-blue-600">Page {processingStatus.pdfPages.current} of {processingStatus.pdfPages.total}</span>
+                    )}
                   </div>
                 </div>
               ) : (
@@ -624,7 +661,7 @@ export default function App() {
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
                 {[
                   { label: "Extraction Success", val: result.summary?.processed || 0, color: "text-green-600", bg: "bg-green-50", border: "border-green-100" },
-                  { label: "Sections Filtered", val: result.summary?.skipped || 0, color: "text-slate-500", bg: "bg-slate-50", border: "border-slate-100" },
+                  { label: "Total API Cost", val: `$${totalCost.toFixed(5)}`, color: "text-blue-500", bg: "bg-blue-50", border: "border-blue-100" },
                   { label: "Validation Errors", val: result.summary?.errors || 0, color: "text-red-600", bg: "bg-red-50", border: "border-red-100" },
                   { label: "Batch Size", val: result.summary?.totalFiles || 0, color: "text-blue-600", bg: "bg-blue-50", border: "border-blue-100" }
                 ].map((stat, i) => (
@@ -660,6 +697,11 @@ export default function App() {
                     >
                       Export .MD
                     </button>
+                    {window.self !== window.top && (
+                      <div className="absolute -top-12 right-0 bg-blue-600 text-white text-[10px] py-1 px-3 rounded-full font-bold animate-bounce whitespace-nowrap shadow-lg">
+                        For "Choose Folder" option, open in new tab ↗
+                      </div>
+                    )}
                   </div>
                 </div>
                 <div className="p-12 prose prose-slate max-w-none prose-headings:font-bold prose-pre:bg-slate-900 prose-pre:rounded-2xl prose-table:border prose-table:border-slate-100">
@@ -713,7 +755,7 @@ export default function App() {
                               </span>
                           </td>
                           <td className="p-5 text-slate-500 font-medium italic">
-                            {entry.reason || entry.error || (entry.score ? `Triage Score: ${entry.score}` : 'Successful extraction')}
+                            {entry.reason || entry.error || (entry.tokens ? `Processed (${entry.tokens.prompt + entry.tokens.candidates} Tok)` : 'Successful extraction')}
                           </td>
                         </tr>
                       ))}
