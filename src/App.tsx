@@ -27,7 +27,13 @@ import { motion, AnimatePresence } from "motion/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { GoogleGenAI } from "@google/genai";
+import * as pdfjsLib from 'pdfjs-dist';
+import { PDFDocument } from 'pdf-lib';
 import { cn } from "./lib/utils";
+
+// Disable workers for pdf.js to stay on the main thread in AI Studio
+// @ts-ignore
+pdfjsLib.GlobalWorkerOptions.workerSrc = '';
 
 // Firebase Imports
 import { initializeApp } from "firebase/app";
@@ -75,6 +81,7 @@ export default function App() {
   const [result, setResult] = useState<ProcessResponse | null>(null);
   const [scoutThreshold, setScoutThreshold] = useState(82);
   const [ageFilter, setAgeFilter] = useState(3);
+  const [ticker, setTicker] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -131,36 +138,83 @@ export default function App() {
           let extractedContent = "";
 
           if (isTxt) {
-            // Bypass logic for transcripts: read verbatim
+            // Verbatim bypass for transcripts
             extractedContent = await file.text();
             combinedAuditLog.push({ filename: file.name, status: "processed", qa: "Verbatim Import" });
+          } else if (isPdf) {
+            // 1. Local Extraction Attempt (Main Thread)
+            let localText = "";
+            try {
+              const arrayBuffer = await file.arrayBuffer();
+              const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer, verbosity: 0 });
+              const pdf = await loadingTask.promise;
+              let fullText = "";
+              // Extract all pages locally to see if it's text-searchable
+              for (let p = 1; p <= pdf.numPages; p++) {
+                const page = await pdf.getPage(p);
+                const textContent = await page.getTextContent();
+                fullText += textContent.items.map((item: any) => item.str).join(" ") + " ";
+              }
+              localText = fullText.trim();
+            } catch (localErr) {
+              console.warn("Local PDF extraction failed/blocked - falling back to AI", localErr);
+            }
+
+            if (localText && localText.length > 500) {
+              // High confidence in local extraction
+              extractedContent = `### Local Extraction Fragment\n\n${localText}\n\n[Note: Local Parser matched >500 chars, AI bypass active for efficiency]`;
+              combinedAuditLog.push({ filename: file.name, status: "processed", qa: "Local Fallback (Main Thread)" });
+            } else {
+              // 2. Smart Scout Fallback (Gemini API with Page Limits)
+              const arrayBuffer = await file.arrayBuffer();
+              const srcDoc = await PDFDocument.load(arrayBuffer);
+              const pageCount = srcDoc.getPageCount();
+              
+              let finalBuffer: Uint8Array;
+              let note = "";
+
+              if (pageCount > 10) {
+                // Slice to first 10 pages for cost optimization
+                const newDoc = await PDFDocument.create();
+                const pagesToCopy = Array.from({ length: 10 }, (_, idx) => idx);
+                const copiedPages = await newDoc.copyPages(srcDoc, pagesToCopy);
+                copiedPages.forEach(p => newDoc.addPage(p));
+                finalBuffer = await newDoc.save();
+                note = `\n\n[Smart Scout Notice: Document was ${pageCount} pages. Clipped to first 10 pages for cost optimization.]`;
+              } else {
+                finalBuffer = new Uint8Array(arrayBuffer);
+              }
+
+              const base64 = btoa(
+                finalBuffer.reduce((data, byte) => data + String.fromCharCode(byte), "")
+              );
+
+              const prompt = `Extract high-fidelity financial data from ${file.name}.
+              RULES:
+              1. Start with YAML (ticker, company_name, doc_date, doc_type, extraction_confidence).
+              2. Convert tables to GFM Markdown. 
+              3. Preserve footnotes, units, currency symbols.
+              4. Output ONLY Markdown.`;
+
+              const parts = [
+                { inlineData: { mimeType: "application/pdf", data: base64 } },
+                { text: prompt }
+              ];
+
+              const response = await ai.models.generateContent({
+                model: AI_MODEL,
+                contents: [{ role: "user", parts }]
+              });
+
+              extractedContent = (response.text || "No content extracted") + note;
+              combinedAuditLog.push({ filename: file.name, status: "processed", qa: `AI Processed (${pageCount > 10 ? 'Clipped' : 'Full'})` });
+            }
           } else {
-            // 1. Native Gemini Extraction (Passing File Directly)
-            const base64 = await new Promise<string>((resolve) => {
-              const reader = new FileReader();
-              reader.onloadend = () => resolve((reader.result as string).split(",")[1]);
-              reader.readAsDataURL(file);
-            });
-
-            const prompt = `Extract high-fidelity financial data from ${file.name}.
-            RULES:
-            1. Start with YAML (ticker, company_name, doc_date, doc_type, extraction_confidence).
-            2. Convert tables to GFM Markdown. 
-            3. Preserve footnotes, units, currency symbols.
-            4. Output ONLY Markdown.`;
-
-            const parts = [
-              { inlineData: { mimeType: contentType || "application/octet-stream", data: base64 } },
-              { text: prompt }
-            ];
-
-            const response = await ai.models.generateContent({
-              model: AI_MODEL,
-              contents: [{ role: "user", parts }]
-            });
-
-            extractedContent = response.text || "No content extracted";
-            combinedAuditLog.push({ filename: file.name, status: "processed", qa: "AI Processed" });
+            // Non-PDF/Text fallback
+            extractedContent = `[Format ${contentType} not natively parsed in local bypass mode]`;
+            combinedAuditLog.push({ filename: file.name, status: "skipped", reason: "Format not supported" });
+            summary.skipped++;
+            continue;
           }
           
           combinedDossier += (combinedDossier ? "\n\n" : "# Master Research Dossier\n\nGenerated: " + new Date().toISOString() + "\n\n") + `## Section: ${file.name}\n\n${extractedContent}\n\n---\n`;
@@ -186,17 +240,43 @@ export default function App() {
     setFiles(prev => prev.filter(f => f.name !== name));
   };
 
-  const downloadDossier = () => {
+  const downloadDossier = async () => {
     if (!result) return;
-    const blob = new Blob([result.dossier], { type: "text/markdown" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `smart_research_dossier_${new Date().toISOString().split('T')[0]}.md`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const cleanTicker = (ticker || "UNKWN").toUpperCase().slice(0, 4);
+    const fileName = `${cleanTicker}_dossier_${timestamp}.md`;
+
+    try {
+      // Try File System Access API for "choose folder" experience
+      if ('showSaveFilePicker' in window) {
+        const handle = await (window as any).showSaveFilePicker({
+          suggestedName: fileName,
+          types: [{
+            description: 'Markdown File',
+            accept: { 'text/markdown': ['.md'] },
+          }],
+        });
+        const writable = await handle.createWritable();
+        await writable.write(result.dossier);
+        await writable.close();
+      } else {
+        // Fallback for standard downloads
+        const blob = new Blob([result.dossier], { type: "text/markdown" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        setError("Download failed: " + err.message);
+      }
+    }
   };
 
   if (authLoading) {
@@ -303,6 +383,21 @@ export default function App() {
             <div className="space-y-6">
               <div className="space-y-3">
                 <div className="flex justify-between text-xs items-center">
+                  <span className="font-semibold text-slate-700">Project Ticker</span>
+                  <span className="text-blue-600 font-bold bg-blue-50 px-2 py-0.5 rounded tracking-widest">{ticker || '---'}</span>
+                </div>
+                <input 
+                  type="text" 
+                  placeholder="E.g. MSFT"
+                  maxLength={4}
+                  value={ticker}
+                  onChange={(e) => setTicker(e.target.value.toUpperCase().slice(0, 4))}
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-bold focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all uppercase placeholder:text-slate-300"
+                />
+                <p className="text-[10px] text-slate-400 leading-tight">Identifier used for automated file naming.</p>
+              </div>
+              <div className="space-y-3">
+                <div className="flex justify-between text-xs items-center">
                   <span className="font-semibold text-slate-700">Scout Threshold</span>
                   <span className="text-blue-600 font-bold bg-blue-50 px-2 py-0.5 rounded">{scoutThreshold}%</span>
                 </div>
@@ -382,7 +477,7 @@ export default function App() {
           {/* Active Pipeline Stages Visualization */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             {[
-              { step: "01", name: "Triage", desc: "412 Pages Scanned", active: !isProcessing && !result, completed: !!result || isProcessing },
+              { step: "01", name: "Triage", desc: files.length > 0 ? `${files.length} Files Ready` : "No Batch Active", active: !isProcessing && !result, completed: !!result || isProcessing },
               { step: "02", name: "Local Parse", desc: isProcessing ? "In Progress..." : result ? "Completed" : "Idle", active: isProcessing, completed: !!result },
               { step: "03", name: "QA Loop", desc: "Analyzing Tables...", active: false, completed: false, pulse: isProcessing },
               { step: "04", name: "AI Export", desc: "Pending Output", active: false, completed: !!result }
