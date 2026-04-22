@@ -240,7 +240,7 @@ export default function App() {
     setFiles(prev => prev.filter(f => f.name !== name));
   };
 
-  const downloadDossier = async () => {
+  const downloadDossier = () => {
     if (!result) return;
     
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -248,34 +248,19 @@ export default function App() {
     const fileName = `${cleanTicker}_dossier_${timestamp}.md`;
 
     try {
-      // Try File System Access API for "choose folder" experience
-      if ('showSaveFilePicker' in window) {
-        const handle = await (window as any).showSaveFilePicker({
-          suggestedName: fileName,
-          types: [{
-            description: 'Markdown File',
-            accept: { 'text/markdown': ['.md'] },
-          }],
-        });
-        const writable = await handle.createWritable();
-        await writable.write(result.dossier);
-        await writable.close();
-      } else {
-        // Fallback for standard downloads
-        const blob = new Blob([result.dossier], { type: "text/markdown" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = fileName;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-      }
+      // Note: File System Access API (showSaveFilePicker) is blocked in cross-origin iframes 
+      // like the AI Studio preview. Using standard blob-link fallback for reliability.
+      const blob = new Blob([result.dossier], { type: "text/markdown" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
     } catch (err: any) {
-      if (err.name !== 'AbortError') {
-        setError("Download failed: " + err.message);
-      }
+      setError("Download failed: " + err.message);
     }
   };
 
