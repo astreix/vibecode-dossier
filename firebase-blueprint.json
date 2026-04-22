@@ -1,0 +1,21 @@
+{
+  "entities": {
+    "user_preferences": {
+      "title": "User Preferences",
+      "description": "App settings for specific users",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "defaultScoutThreshold": { "type": "number" },
+        "defaultAgeFilter": { "type": "number" }
+      },
+      "required": ["userId"]
+    }
+  },
+  "firestore": {
+    "/user_preferences/{userId}": {
+      "schema": "user_preferences",
+      "description": "Saves user-specific dashboard settings"
+    }
+  }
+}

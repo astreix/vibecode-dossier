@@ -1,0 +1,6 @@
+{
+  "name": "Smart Research Dossier Generator",
+  "description": "Convert financial filings into high-fidelity, LLM-optimized Markdown dossiers using multi-stage AI extraction and triage.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
