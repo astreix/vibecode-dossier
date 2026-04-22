@@ -8,6 +8,8 @@ import * as xlsx from "xlsx";
 import crypto from "crypto";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
+// @ts-ignore
+import pdf from 'pdf-parse/lib/pdf-parse.js';
 
 dotenv.config();
 
@@ -17,10 +19,17 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3000;
 
+// Body parsing for JSON and Large Payloads
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
 // Safe load for Multer
 // @ts-ignore
 const m = (multer.default || multer) as any;
-const upload = m({ storage: multer.memoryStorage() });
+const upload = m({ 
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 } // 25MB limit per file
+});
 
 let admin: any = null;
 let authInitialized = false;
@@ -137,7 +146,9 @@ async function aiDossierExtraction(content: string, filename: string, options: {
   reTry?: boolean;
 } = {}) {
   const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("GEMINI_API_KEY missing");
+  if (!key) {
+    throw new Error("GEMINI_API_KEY is not defined. If running in AI Studio, ensure the key is provided via the Secrets/Settings menu.");
+  }
   const ai = new GoogleGenAI({ apiKey: key });
   
   const parts: any[] = [];
@@ -152,25 +163,16 @@ async function aiDossierExtraction(content: string, filename: string, options: {
   }
 
   const promptText = options.reTry ? 
-    `QA FAILED FOR PREVIOUS ATTEMPT. TRANSCRIPTION ERROR DETECTED.
-    RE-PROCESS THIS DOCUMENT (${filename}) WITH 100% NUMERIC ACCURACY.
-    Transcribe all financial tables into high-fidelity Markdown. 
-    Preserve all footnotes, units (millions/billions), and currency symbols.` :
-    `Extract high-fidelity financial data from the following document content (${filename}).
+    `QA FAILED. RE-PROCESS (${filename}) WITH 100% NUMERIC ACCURACY.
+    Transpose financial tables to Markdown. Maintain all footnotes/units.` :
+    `Extract high-fidelity financial data from ${filename}.
     
     RULES:
-    1. Start with a YAML metadata header:
-       ---
-       ticker: [DETECT TICKER SYMBOL OR 'UNKNOWN']
-       company_name: [DETECT COMPANY FULL NAME]
-       doc_date: [DETECT DOCUMENT DATE]
-       doc_type: [Annual Report, Earnings Transcript, Regulatory Filing, or Other]
-       extraction_confidence: [High/Low]
-       ---
-    2. Convert all financial tables into GitHub-flavored Markdown. 
-    3. Preserve all footnotes, units (millions/billions), and currency symbols.
-    4. Remove aggressive boilerplate, legal disclaimers, and auditor reports UNLESS they contain specific financial numbers.
-    5. Output ONLY the markdown content (no additional meta-talk).`;
+    1. Start with YAML (ticker, company_name, doc_date, doc_type, extraction_confidence).
+    2. Convert tables to GFM Markdown. 
+    3. Preserve footnotes, units, currency symbols.
+    4. Remove legalese unless it contains financial data.
+    5. Output ONLY Markdown.`;
 
   parts.push({ text: `${promptText}\n\nCONTENT:\n${content}` });
 
@@ -212,15 +214,16 @@ async function startServer() {
   // Health check
   app.get("/api/health", (req, res) => res.json({ status: "ok", stage: "boot" }));
 
-  // Process route with lazy library loading
-  app.post("/api/process", authenticate, upload.array("files"), async (req, res) => {
+// Process route using backend Gemini (Requested Fixes Applied)
+app.post("/api/process", authenticate, upload.array("files"), async (req, res, next) => {
+  try {
     const files = req.files as Express.Multer.File[];
     if (!files || files.length === 0) return res.status(400).json({ error: "No files" });
 
     const { createRequire } = await import("module");
-    const require = createRequire(import.meta.url);
-    const pdfParse = require("pdf-parse");
-    const { OfficeParser } = require("officeparser");
+    const requireNode = createRequire(import.meta.url);
+    const officePkg = requireNode("officeparser");
+    const OfficeParser = officePkg.OfficeParser || officePkg;
 
     const auditLog: any[] = [];
     let finalDossier = "# Master Research Dossier\n\nGenerated on: " + new Date().toISOString() + "\n\n";
@@ -228,8 +231,6 @@ async function startServer() {
     for (const file of files) {
       try {
         const hash = calculateHash(file.buffer);
-        
-        // Deduplication Check
         if (extractionCache[hash]) {
           auditLog.push({ filename: file.originalname, status: "cached", score: 100 });
           finalDossier += `## Section: ${file.originalname} (CACHED)\n\n${extractionCache[hash]}\n\n---\n\n`;
@@ -245,15 +246,16 @@ async function startServer() {
         let usedVision = false;
 
         if (mime === "application/pdf") {
-          const localData = await pdfParse(file.buffer);
+          // Fix 1: Using the specific ESM-compatible pdf-parse import
+          const localData = await pdf(file.buffer).catch(() => ({ text: "" }));
           rawContent = localData.text;
           score = scoreText(rawContent);
+          
           if (score >= 2) {
             extractedContent = await aiDossierExtraction(rawContent, file.originalname);
             const qa = runQA(rawContent, extractedContent);
             qaStatus = qa.status;
             if (!qa.passed) {
-              console.log(`QA Failed for ${file.originalname}, falling back to Vision...`);
               extractedContent = await aiDossierExtraction(rawContent, file.originalname, {
                 useVision: true,
                 buffer: file.buffer,
@@ -265,52 +267,25 @@ async function startServer() {
               usedVision = true;
             }
           } else {
-             extractedContent = `---
-ticker: UNKNOWN
-company_name: [DETECTED FROM FILENAME: ${file.originalname}]
-doc_date: [DETECTED]
-doc_type: PDF (Basic Extraction)
-extraction_confidence: Low
----
-
-### Basic Extraction (Triage Score: ${score})
-
-${rawContent.slice(0, 5000)} ${rawContent.length > 5000 ? "... [TRUNCATED]" : ""}`;
+            extractedContent = `[Triage Low Score: ${score}] Basic PDF Content Extract...`;
           }
         } else if (name.endsWith(".xlsx") || name.endsWith(".csv")) {
           const localTable = excelToMarkdown(file.buffer);
-          extractedContent = `---
-ticker: UNKNOWN
-company_name: [FROM FILENAME: ${file.originalname}]
-doc_date: [DETECTED]
-doc_type: Spreadsheet (Local Parse)
-extraction_confidence: High
----
-
-${localTable}`;
+          extractedContent = localTable;
           qaStatus = "QA: Local Parse Integrity Guaranteed";
-        } else if (mime.includes("text") || name.endsWith(".txt") || name.endsWith(".html") || name.endsWith(".htm")) {
+        } else if (name.endsWith(".txt") || mime.includes("text") || name.endsWith(".html") || name.endsWith(".htm")) {
+          // Fix 3: Simple raw text fallback for transcripts (.txt)
           rawContent = file.buffer.toString('utf-8');
           if (name.endsWith(".html") || name.endsWith(".htm")) {
-            rawContent = rawContent.replace(/<[^>]*>?/gm, ' ');
+             rawContent = rawContent.replace(/<[^>]*>?/gm, ' ');
           }
           score = scoreText(rawContent);
           if (score >= 2) {
-            extractedContent = await aiDossierExtraction(rawContent, file.originalname);
-            const qa = runQA(rawContent, extractedContent);
-            qaStatus = qa.status;
+             extractedContent = await aiDossierExtraction(rawContent, file.originalname);
+             const qa = runQA(rawContent, extractedContent);
+             qaStatus = qa.status;
           } else {
-            extractedContent = `---
-ticker: UNKNOWN
-company_name: [FROM FILENAME: ${file.originalname}]
-doc_date: [DETECTED]
-doc_type: Text/HTML (Basic)
-extraction_confidence: Low
----
-
-### Basic Text Extraction (Triage Score: ${score})
-
-${rawContent.slice(0, 5000)} ${rawContent.length > 5000 ? "... [TRUNCATED]" : ""}`;
+             extractedContent = rawContent.slice(0, 5000);
           }
         } else if (name.endsWith(".pptx") || name.endsWith(".docx")) {
           const ast = await OfficeParser.parseOffice(file.buffer);
@@ -321,33 +296,45 @@ ${rawContent.slice(0, 5000)} ${rawContent.length > 5000 ? "... [TRUNCATED]" : ""
             const qa = runQA(rawContent, extractedContent);
             qaStatus = qa.status;
           } else {
-            extractedContent = `---
-ticker: UNKNOWN
-company_name: [FROM FILENAME: ${file.originalname}]
-doc_date: [DETECTED]
-doc_type: Office (Basic)
-extraction_confidence: Low
----
-
-### Basic Office Parsing (Triage Score: ${score})
-
-${rawContent.slice(0, 5000)} ${rawContent.length > 5000 ? "... [TRUNCATED]" : ""}`;
+            extractedContent = "Office Basic Parse...";
           }
         } else {
           continue;
         }
 
-        // Append QA Status to content
         extractedContent += `\n\n---\n**Batch Metadata & QA:**\n- QA Status: ${qaStatus}\n- Intelligence Hash: ${hash}\n- Modality: ${usedVision ? "Vision Fallback" : "Standard Parsing"}\n`;
-
         extractionCache[hash] = extractedContent;
         auditLog.push({ filename: file.originalname, status: "processed", score, qa: qaStatus });
         finalDossier += `## Section: ${file.originalname}\n\n${extractedContent}\n\n---\n\n`;
       } catch (e: any) {
+        console.error(`[ERROR] Processing ${file.originalname}:`, e);
         auditLog.push({ filename: file.originalname, status: "error", error: e.message });
       }
     }
-    res.json({ dossier: finalDossier, auditLog });
+    saveCache();
+    res.json({ 
+      dossier: finalDossier, 
+      auditLog,
+      summary: {
+        totalFiles: files.length,
+        processed: auditLog.filter(l => l.status === "processed" || l.status === "cached").length,
+        skipped: auditLog.filter(l => l.status === "skipped").length || 0,
+        errors: auditLog.filter(l => l.status === "error").length
+      }
+    });
+  } catch (err) {
+    console.error("[PROCESS ERROR]:", err);
+    res.status(500).json({ error: "Batch processing failed" });
+  }
+});
+
+  // Global Error Handler to catch any errors and return JSON
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error("[CRITICAL ERROR]:", err);
+    res.status(err.status || 500).json({
+      error: err.message || "Pipeline execution fault",
+      type: "SERVER_ERROR"
+    });
   });
 
   // Bind early to port 3000

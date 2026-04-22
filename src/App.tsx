@@ -65,6 +65,7 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [files, setFiles] = useState<File[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingStatus, setProcessingStatus] = useState<{ current: number; total: number; fileName: string } | null>(null);
   const [result, setResult] = useState<ProcessResponse | null>(null);
   const [scoutThreshold, setScoutThreshold] = useState(82);
   const [ageFilter, setAgeFilter] = useState(3);
@@ -101,30 +102,81 @@ export default function App() {
     
     setIsProcessing(true);
     setError(null);
-    const formData = new FormData();
-    files.forEach(file => formData.append("files", file));
-    formData.append("scoutThreshold", scoutThreshold.toString());
-    formData.append("ageFilter", ageFilter.toString());
+    setResult(null);
+
+    let combinedDossier = "";
+    let combinedAuditLog: AuditLogEntry[] = [];
+    let summary = { totalFiles: files.length, processed: 0, skipped: 0, errors: 0 };
 
     try {
       const idToken = await user.getIdToken();
-      const response = await fetch("/api/process", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${idToken}`
-        },
-        body: formData,
-      });
-      
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Processing failed on server");
-      
-      setResult(data);
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        setProcessingStatus({ current: i + 1, total: files.length, fileName: file.name });
+
+        const formData = new FormData();
+        formData.append("files", file);
+
+        const response = await fetch("/api/process", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${idToken}`
+          },
+          body: formData,
+        });
+
+        const contentType = response.headers.get("content-type");
+        if (!contentType || !contentType.includes("application/json")) {
+          throw new Error(`Server Error (${response.status}) on file ${file.name}.`);
+        }
+
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || `Failed on ${file.name}`);
+
+        // Merge results
+        const dossierContent = (data.dossier || "").replace(/# Master Research Dossier[\s\S]*?Generated on:.*?\n\n/, "");
+        combinedDossier += (combinedDossier ? "\n\n" : "# Master Research Dossier\n\n") + dossierContent;
+        
+        if (data.auditLog && Array.isArray(data.auditLog)) {
+          combinedAuditLog = [...combinedAuditLog, ...data.auditLog];
+        }
+
+        if (data.summary) {
+          summary.processed += (data.summary.processed || 0);
+          summary.skipped += (data.summary.skipped || 0);
+          summary.errors += (data.summary.errors || 0);
+        }
+      }
+
+      setResult({ dossier: combinedDossier, auditLog: combinedAuditLog, summary });
     } catch (err: any) {
-      setError(err.message || "An unexpected error occurred");
+      console.error("Batch processing error:", err);
+      setError(err.message || "An unexpected error occurred.");
     } finally {
       setIsProcessing(false);
+      setProcessingStatus(null);
     }
+  };
+
+  const runQA = (originalText: string, extractedMarkdown: string): { status: string; passed: boolean } => {
+    const originalNumbers = (originalText.match(/\d+([\.,]\d+)?/g) || []).length;
+    const extractedNumbers = (extractedMarkdown.match(/\d+([\.,]\d+)?/g) || []).length;
+    const missingRatio = originalNumbers > 0 ? (extractedNumbers / originalNumbers) : 1;
+    const hasCurrencySymbols = /[\$€£]/.test(extractedMarkdown);
+    const originalCurrency = /[\$€£]/.test(originalText);
+    
+    let passed = true;
+    let status = "QA: Passed [Manual Check Recommended]";
+
+    if (missingRatio < 0.5 && originalNumbers > 10) {
+      passed = false;
+      status = "QA: Failed [Low Numeric Coverage]";
+    } else if (originalCurrency && !hasCurrencySymbols) {
+      passed = false;
+      status = "QA: Failed [Currency Symbols Missing]";
+    }
+    return { status, passed };
   };
 
   const removeFile = (name: string) => {
@@ -373,7 +425,8 @@ export default function App() {
                     <Upload className="w-8 h-8 text-slate-400" />
                   </div>
                   <h2 className="text-2xl font-bold text-slate-800 mb-2">Initialize Batch Pipeline</h2>
-                  <p className="text-sm font-medium text-slate-500 mb-8">Drop PDF reports, Excel workbooks, PPTX presentations, or Text/HTML transcripts</p>
+                  <p className="text-sm font-medium text-slate-500 mb-4">Drop PDF reports, Excel workbooks, PPTX presentations, or Text/HTML transcripts</p>
+                  <p className="text-[10px] text-amber-600 font-bold uppercase mb-8">Recommendation: Limit batches to 5-10 files to prevent pipeline timeouts.</p>
                   <div className="flex gap-4 flex-wrap justify-center">
                     <span className="bg-slate-100 px-3 py-1 rounded-full text-[10px] font-bold text-slate-500 uppercase tracking-widest border border-slate-200">pdf support</span>
                     <span className="bg-slate-100 px-3 py-1 rounded-full text-[10px] font-bold text-slate-500 uppercase tracking-widest border border-slate-200">office docx/pptx</span>
@@ -438,22 +491,42 @@ export default function App() {
                 </div>
               </div>
               <h2 className="text-3xl font-bold text-slate-800 mb-3 tracking-tight">System Processing Run</h2>
-              <p className="text-slate-500 font-medium max-w-sm mb-10">Executing multi-stage extraction protocol. Analyzing tables and reconciling financial statements...</p>
               
-              <div className="w-full max-w-md space-y-4">
-                <div className="relative h-2 bg-slate-100 rounded-full overflow-hidden">
-                  <motion.div 
-                    initial={{ x: "-100%" }}
-                    animate={{ x: "0%" }}
-                    transition={{ repeat: Infinity, duration: 2, ease: "easeInOut" }}
-                    className="absolute inset-0 w-full bg-gradient-to-r from-transparent via-blue-500 to-transparent"
-                  />
+              {processingStatus ? (
+                <div className="w-full max-w-md space-y-4">
+                  <p className="text-slate-500 font-medium mb-2">
+                    Analyzing: <span className="text-blue-600 font-bold">{processingStatus.fileName}</span>
+                  </p>
+                  
+                  <div className="relative h-2 bg-slate-100 rounded-full overflow-hidden">
+                    <motion.div 
+                      className="absolute inset-0 bg-blue-600"
+                      initial={{ width: 0 }}
+                      animate={{ width: `${(processingStatus.current / processingStatus.total) * 100}%` }}
+                      transition={{ duration: 0.5 }}
+                    />
+                  </div>
+                  
+                  <div className="flex justify-between text-[10px] font-bold uppercase tracking-[0.2em] text-slate-400">
+                    <span>Document {processingStatus.current} of {processingStatus.total}</span>
+                    <span className="animate-pulse">Active Protocol</span>
+                  </div>
                 </div>
-                <div className="flex justify-between text-[10px] font-bold uppercase tracking-[0.2em] text-slate-400 animate-pulse">
-                  <span>Triage: Scanning</span>
-                  <span>AI: Pending Validation</span>
-                </div>
-              </div>
+              ) : (
+                <>
+                  <p className="text-slate-500 font-medium max-w-sm mb-10">Executing multi-stage extraction protocol. Analyzing tables and reconciling financial statements...</p>
+                  <div className="w-full max-w-md space-y-4">
+                    <div className="relative h-2 bg-slate-100 rounded-full overflow-hidden">
+                      <motion.div 
+                        initial={{ x: "-100%" }}
+                        animate={{ x: "0%" }}
+                        transition={{ repeat: Infinity, duration: 2, ease: "easeInOut" }}
+                        className="absolute inset-0 w-full bg-gradient-to-r from-transparent via-blue-500 to-transparent"
+                      />
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
           )}
 
@@ -467,10 +540,10 @@ export default function App() {
               {/* Performance Stats Overlay */}
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
                 {[
-                  { label: "Extraction Success", val: result.summary.processed, color: "text-green-600", bg: "bg-green-50", border: "border-green-100" },
-                  { label: "Sections Filtered", val: result.summary.skipped, color: "text-slate-500", bg: "bg-slate-50", border: "border-slate-100" },
-                  { label: "Validation Errors", val: result.summary.errors, color: "text-red-600", bg: "bg-red-50", border: "border-red-100" },
-                  { label: "Batch Size", val: result.summary.totalFiles, color: "text-blue-600", bg: "bg-blue-50", border: "border-blue-100" }
+                  { label: "Extraction Success", val: result.summary?.processed || 0, color: "text-green-600", bg: "bg-green-50", border: "border-green-100" },
+                  { label: "Sections Filtered", val: result.summary?.skipped || 0, color: "text-slate-500", bg: "bg-slate-50", border: "border-slate-100" },
+                  { label: "Validation Errors", val: result.summary?.errors || 0, color: "text-red-600", bg: "bg-red-50", border: "border-red-100" },
+                  { label: "Batch Size", val: result.summary?.totalFiles || 0, color: "text-blue-600", bg: "bg-blue-50", border: "border-blue-100" }
                 ].map((stat, i) => (
                   <div key={i} className={cn("p-5 border rounded-2xl bg-white shadow-sm ring-1 ring-inset", stat.border)}>
                     <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-1">{stat.label}</div>
@@ -532,7 +605,7 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-50">
-                      {result.auditLog.map((entry, i) => (
+                      {result.auditLog?.map((entry, i) => (
                         <tr key={i} className="hover:bg-slate-50/50 transition-colors">
                           <td className="p-5">
                             <span className="font-bold text-slate-700">{entry.filename}</span>
