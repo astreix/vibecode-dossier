@@ -165,11 +165,12 @@ export default function App() {
               "Balance Sheet": /(?:Consolidated\s+)?Balance\s+Sheet|(?:Statement\s+of\s+)?Financial\s+Position/i,
               "Cash Flows": /(?:Consolidated\s+)?Statement(?:s)?\s+of\s+Cash\s+Flows|Cash\s+Flow/i,
               "MD&A": /Management['''’]?s\s+Discussion|MD&A|Business\s+Review|CEO\s+Update/i,
-              "Segment Notes": /Segment\s+Reporting|Segment\s+Information|Notes\s+to\s+the\s+Financial|Segment\s+Performance|Financial\s+Highlights/i
+              "Segment Notes": /Segment\s+Reporting|Segment\s+Information|Notes\s+to\s+the\s+Financial|Segment\s+Performance|Financial\s+Highlights/i,
+              "Appendix": /Appendix|Financial\s+Summary|Key\s+Figures|Financial\s+Appendix/i
             };
 
-            const foundSections = new Set<string>();
-            const targetPageIndices = new Set<number>();
+            let foundSections: string[] = [];
+            let targetPages: number[] = [];
 
             // 2. Iterate through PDF pages locally
             try {
@@ -187,41 +188,52 @@ export default function App() {
                 const totalChars = pageText.length || 1;
                 const numericDensity = digits / totalChars;
 
-                if (numericDensity > 0.06) {
-                  targetPageIndices.add(idx);
-                  foundSections.add("Numeric Density Matrix (Table Detected)");
+                if (numericDensity > 0.035) {
+                  targetPages.push(idx);
+                  if (!foundSections.includes("Numeric Density Matrix")) {
+                    foundSections.push("Numeric Density Matrix");
+                  }
                 }
 
                 // 2b. Test patterns for sections not yet found
                 Object.entries(sectionPatterns).forEach(([section, pattern]) => {
-                  if (!foundSections.has(section) && pattern.test(pageText)) {
-                    foundSections.add(section);
-                    // Add current page and next 2 pages (0-indexed)
-                    targetPageIndices.add(idx);
-                    if (idx + 1 < totalPages) targetPageIndices.add(idx + 1);
-                    if (idx + 2 < totalPages) targetPageIndices.add(idx + 2);
+                  if (!foundSections.includes(section) && pattern.test(pageText)) {
+                    foundSections.push(section);
+                    
+                    if (section === "Appendix") {
+                      // Multi-Page Overflow Fix: Grab everything from here to the end
+                      for (let overflowIdx = idx; overflowIdx < totalPages; overflowIdx++) {
+                        targetPages.push(overflowIdx);
+                      }
+                    } else {
+                      // Add current page and next 2 pages (0-indexed)
+                      targetPages.push(idx);
+                      if (idx + 1 < totalPages) targetPages.push(idx + 1);
+                      if (idx + 2 < totalPages) targetPages.push(idx + 2);
+                    }
                   }
                 });
-
-                // Optimization: Break if all sections found
-                if (foundSections.size === (Object.keys(sectionPatterns).length + (foundSections.has("Numeric Density Matrix (Table Detected)") ? 1 : 0))) {
-                  // We don't really want to break early if we are hunting for specific sections 
-                  // but density check keeps adding itself. 
-                  // Let's just check if all regex patterns are matched.
-                  const allRegexMatched = Object.keys(sectionPatterns).every(s => foundSections.has(s));
-                  if (allRegexMatched) break;
-                }
               }
             } catch (err) {
               console.warn("Local scan failed", err);
             }
 
             // 3. Slice the PDF
-            let finalIndices = Array.from(targetPageIndices).sort((a, b) => a - b);
+            let finalIndices = [...new Set(targetPages)].sort((a, b) => a - b);
             
+            // Debug Logging for triage
+            if (finalIndices.length === 0) {
+              console.log("Scanner failed match. Diagnostics:", { 
+                targetPagesLength: targetPages.length, 
+                foundSections, 
+                totalPages 
+              });
+            }
+
             // Fallback: If no sections found after both Regex and Density checks
             if (finalIndices.length === 0) {
               finalIndices = Array.from({ length: Math.min(15, totalPages) }, (_, i) => i);
+              foundSections = ["Manual Triage Fallback (P1-15)"];
             }
 
             const newDoc = await PDFDocument.create();
@@ -250,7 +262,7 @@ export default function App() {
             });
 
             // 5. Update metadata block
-            const metadata = `\n\n> **Scout Method**: Local Content-Aware Scan\n> **Sections Located**: ${foundSections.size > 0 ? Array.from(foundSections).join(", ") : "Manual Triage Fallback (P1-15)"}\n> **Pages Processed**: ${finalIndices.length} out of ${totalPages}\n\n`;
+            const metadata = `\n\n> **Scout Method**: Local Content-Aware Scan\n> **Sections Located**: ${foundSections.length > 0 ? foundSections.join(", ") : "Manual Triage Fallback (P1-15)"}\n> **Pages Processed**: ${finalIndices.length} out of ${totalPages}\n\n`;
             extractedContent = (response.text || "No content extracted") + metadata;
 
             // Usage Tracking
