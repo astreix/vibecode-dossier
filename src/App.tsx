@@ -155,140 +155,97 @@ export default function App() {
             extractedContent = await file.text();
             combinedAuditLog.push({ filename: file.name, status: "processed", qa: "Verbatim Import" });
           } else if (isPdf) {
-            // --- Phase 1: Local TOC Extraction ---
-            let localTOCText = "";
-            let totalPdfPages = 0;
             const arrayBuffer = await file.arrayBuffer();
+            const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer, verbosity: 0 });
+            const pdf = await loadingTask.promise;
+            const totalPages = pdf.numPages;
+            
+            // --- PASS 1: THE SCOUT ---
+            // Extract text from first 15 pages to find the Table of Contents
+            let tocText = "";
+            const scanLimit = Math.min(15, totalPages);
+            for (let p = 1; p <= scanLimit; p++) {
+              const page = await pdf.getPage(p);
+              const textContent = await page.getTextContent();
+              tocText += `--- Page ${p} ---\n` + textContent.items.map((item: any) => item.str).join(" ") + "\n";
+            }
+
+            const scoutPrompt = `Review this Table of Contents/Intro text from a financial report. 
+            Identify the exact page numbers for: MD&A, Income Statement, Balance Sheet, Cash Flow, and Segment/Financial Notes.
+            RETURN ONLY A JSON OBJECT: {"pages": [1, 2, 3, 4, 5], "sections": ["MD&A", "Balance Sheet"]}.
+            Convert section names to 0-indexed page numbers.
+            TEXT: ${tocText}`;
+
+            const scoutResponse = await ai.models.generateContent({
+              model: "gemini-2.5-flash-lite",
+              contents: [{ role: "user", parts: [{ text: scoutPrompt }] }]
+            });
+
+            let targetPages: number[] = [];
+            let foundSections: string[] = [];
+            let scoutDebug = "";
+            
             try {
-              const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer, verbosity: 0 });
-              const pdf = await loadingTask.promise;
-              totalPdfPages = pdf.numPages;
-              setProcessingStatus(prev => prev ? { ...prev, pdfPages: { current: 0, total: totalPdfPages } } : null);
-              
-              // Extract first 15 pages for Scout pass text
-              const pagesToScout = Math.min(15, totalPdfPages);
-              let tempText = "";
-              for (let p = 1; p <= pagesToScout; p++) {
-                setProcessingStatus(prev => prev ? { ...prev, pdfPages: { current: p, total: totalPdfPages } } : null);
-                const page = await pdf.getPage(p);
-                const textContent = await page.getTextContent();
-                tempText += `Page ${p}: ` + textContent.items.map((item: any) => item.str).join(" ") + "\n";
-              }
-              localTOCText = tempText.trim();
-            } catch (err) {
-              console.warn("Local TOC extraction failed", err);
+              scoutDebug = scoutResponse.text.replace(/```json|```/g, "").trim();
+              const scoutResult = JSON.parse(scoutDebug);
+              // Ensure we have unique, valid, 0-indexed page numbers
+              targetPages = [...new Set(scoutResult.pages as number[])]
+                .filter(p => p >= 0 && p < totalPages)
+                .sort((a, b) => a - b);
+              foundSections = scoutResult.sections || [];
+            } catch (e) {
+              console.warn("Scout parse failed, falling back to P1-15", e);
+              targetPages = Array.from({ length: Math.min(15, totalPages) }, (_, i) => i);
+              foundSections = ["Manual Triage Fallback (P1-15)"];
             }
 
-            // --- Phase 2: The LLM Scout Pass ---
-            let targetedPages: number[] = [];
-            let sectionsFound: string[] = [];
-            let rawScoutJson = "";
-
-            if (localTOCText) {
-              const scoutPrompt = `Analyze the provided Table of Contents / initial text from a financial document:
-              "${localTOCText.slice(0, 15000)}"
-              
-              Identify the exact page numbers for the following sections: "MD&A", "Income Statement", "Balance Sheet", "Cash Flows", and "Segment Reporting".
-              
-              Return ONLY a JSON object. No preamble. No explanation. 
-              Format: {"sections": [{"name": "MD&A", "pages": [5, 12]}], "all_relevant_pages": [5, 6, 7, 8, 9, 10, 11, 12, 15, 16]}
-              Note: Page numbers must be 1-indexed.`;
-
-              try {
-                const scoutResponse = await ai.models.generateContent({
-                  model: AI_MODEL,
-                  contents: [{ role: "user", parts: [{ text: scoutPrompt }] }]
-                });
-                
-                rawScoutJson = scoutResponse.text || "{}";
-                
-                // Track Scout Cost
-                if (scoutResponse.usageMetadata) {
-                  const { promptTokenCount = 0, candidatesTokenCount = 0 } = scoutResponse.usageMetadata;
-                  runningCost += (promptTokenCount * FLASH_LITE_IN) + (candidatesTokenCount * FLASH_LITE_OUT);
-                  setTotalCost(runningCost);
-                }
-                
-                // Robust JSON Parsing
-                const cleanJson = rawScoutJson.replace(/```json|```/g, "").trim();
-                const scoutJsonMatch = cleanJson.match(/\{[\s\S]*\}/);
-                
-                if (scoutJsonMatch) {
-                  const scoutData = JSON.parse(scoutJsonMatch[0]);
-                  targetedPages = scoutData.all_relevant_pages || [];
-                  sectionsFound = (scoutData.sections || [])
-                    .filter((s: any) => s.pages && s.pages.length > 0)
-                    .map((s: any) => s.name);
-                }
-              } catch (scoutErr) {
-                console.error("Scout pass failed/JSON invalid", scoutErr);
-              }
-            }
-
-            // --- Phase 3: Targeted Slicing ---
-            // Sanitize: unique, sorted, and bound to actual PDF pages
-            targetedPages = [...new Set(targetedPages)]
-              .filter(p => p > 0 && p <= totalPdfPages)
-              .sort((a, b) => a - b);
-
-            // Fallback: If scout failed or returned empty array, 1-15
-            let indicesToCopy = targetedPages.map(p => p - 1);
-            if (indicesToCopy.length === 0) {
-              indicesToCopy = Array.from({ length: Math.min(15, totalPdfPages) }, (_, i) => i);
-              targetedPages = indicesToCopy.map(i => i + 1); // Update for metadata
-            }
-
+            // --- PASS 2: TARGETED EXTRACTION ---
             const srcDoc = await PDFDocument.load(arrayBuffer);
-            const targetedDoc = await PDFDocument.create();
-            // copyPages takes 0-indexed indices
-            const copiedPages = await targetedDoc.copyPages(srcDoc, indicesToCopy);
-            copiedPages.forEach(p => targetedDoc.addPage(p));
-            const targetedBuffer = await targetedDoc.save();
+            const newDoc = await PDFDocument.create();
+            
+            // If scout found nothing, default to first 15
+            if (targetPages.length === 0) {
+                targetPages = Array.from({ length: Math.min(15, totalPages) }, (_, i) => i);
+            }
+
+            const copiedPages = await newDoc.copyPages(srcDoc, targetPages);
+            copiedPages.forEach(p => newDoc.addPage(p));
+            const finalBuffer = await newDoc.save();
 
             const base64 = btoa(
-              targetedBuffer.reduce((data, byte) => data + String.fromCharCode(byte), "")
+              finalBuffer.reduce((data, byte) => data + String.fromCharCode(byte), "")
             );
 
-            // --- Phase 4: Deep Extraction & Metadata ---
-            const extractionPrompt = `Extract high-fidelity financial data from the provided document batch.
+            const deepPrompt = `Extract high-fidelity financial data from the attached pages.
             RULES:
-            1. Start with YAML (ticker: ${ticker || 'UNKWN'}, company_name, doc_date, doc_type, extraction_confidence).
-            2. Convert all financial tables to exact GFM Markdown tables. Do not summarize tables. Preserve ALL rows and columns.
-            3. Preserve footnotes, units, currency symbols.
+            1. Start with YAML (ticker, company_name, doc_date, doc_type, extraction_confidence).
+            2. Convert all financial tables to strict GFM Markdown tables. Do not summarize tables.
+            3. Focus on MD&A insights and Segment Reporting details.
             4. Output ONLY Markdown.`;
 
-            const extractParts = [
-              { inlineData: { mimeType: "application/pdf", data: base64 } },
-              { text: extractionPrompt }
-            ];
-
-            const extractResponse = await ai.models.generateContent({
+            const response = await ai.models.generateContent({
               model: AI_MODEL,
-              contents: [{ role: "user", parts: extractParts }]
+              contents: [{ role: "user", parts: [
+                { inlineData: { mimeType: "application/pdf", data: base64 } },
+                { text: deepPrompt }
+              ] }]
             });
 
-            let extractionTokens = { prompt: 0, candidates: 0 };
-            if (extractResponse.usageMetadata) {
-              const { promptTokenCount = 0, candidatesTokenCount = 0 } = extractResponse.usageMetadata;
-              extractionTokens = { prompt: promptTokenCount, candidates: candidatesTokenCount };
+            const metadata = `\n\n> **Extraction Strategy**: Targeted Anchor-Driven\n> **Pages Processed**: ${targetPages.length} out of ${totalPages}\n> **Sections Located**: ${foundSections.join(", ")}\n> **Scout Debug JSON**: \`${scoutDebug}\`\n\n`;
+            extractedContent = (response.text || "No content extracted") + metadata;
+
+            // Usage Tracking
+            if (response.usageMetadata) {
+              const { promptTokenCount = 0, candidatesTokenCount = 0 } = response.usageMetadata;
               runningCost += (promptTokenCount * FLASH_LITE_IN) + (candidatesTokenCount * FLASH_LITE_OUT);
               setTotalCost(runningCost);
+              combinedAuditLog.push({ 
+                filename: file.name, 
+                status: "processed", 
+                qa: `AI Targeted (${targetPages.length} pgs)`,
+                tokens: { prompt: promptTokenCount, candidates: candidatesTokenCount }
+              });
             }
-
-            const qaMeta = `> **Extraction Strategy**: Targeted Anchor-Driven
-> **Pages Processed**: ${targetedPages.length} out of ${totalPdfPages}
-> **Sections Successfully Located**: ${sectionsFound.length > 0 ? sectionsFound.join(", ") : "Manual Triage Fallback (P1-15)"}
-> **Scout Debug JSON**: \`${rawScoutJson.replace(/\n/g, ' ')}\`
-
-\n\n`;
-
-            extractedContent = qaMeta + (extractResponse.text || "No content extracted");
-            combinedAuditLog.push({ 
-              filename: file.name, 
-              status: "processed", 
-              qa: sectionsFound.length > 0 ? "Targeted Success" : "Fallback Mode",
-              tokens: extractionTokens
-            });
           } else {
             // Non-PDF/Text fallback
             extractedContent = `[Format ${contentType} not natively parsed in local bypass mode]`;
