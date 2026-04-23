@@ -124,7 +124,6 @@ export default function App() {
       setError("GEMINI_API_KEY is missing. Please ensure you have added a 'GEMINI_API_KEY' secret in the AI Studio Settings (top right gear icon).");
       return;
     }
-    
     setIsProcessing(true);
     setError(null);
     setResult(null);
@@ -135,7 +134,7 @@ export default function App() {
     let summary = { totalFiles: files.length, processed: 0, skipped: 0, errors: 0, cost: 0 };
     let runningCost = 0;
 
-    const FLASH_LITE_IN = 0.000000075;
+    const FLASH_LITE_IN =  0.000000075;
     const FLASH_LITE_OUT = 0.0000003;
 
     try {
@@ -159,18 +158,20 @@ export default function App() {
             const srcDoc = await PDFDocument.load(arrayBuffer);
             const totalPages = srcDoc.getPageCount();
 
-            // 1. Define target sections and Regex patterns (Expanded for presentations)
+            // 1. Define target sections and Regex patterns
             const sectionPatterns = {
-              "Income Statement": /(?:Consolidated\s+)?(?:Statement\s+of\s+)?(?:Comprehensive\s+)?Income|Income\s+Statement|Financial\s+Overview|P&L|Profit\s+and\s+Loss|Financial\s+Performance/i,
-              "Balance Sheet": /(?:Consolidated\s+)?Balance\s+Sheet|(?:Statement\s+of\s+)?Financial\s+Position/i,
-              "Cash Flows": /(?:Consolidated\s+)?Statement(?:s)?\s+of\s+Cash\s+Flows|Cash\s+Flow/i,
-              "MD&A": /Management['''’]?s\s+Discussion|MD&A|Business\s+Review|CEO\s+Update/i,
-              "Segment Notes": /Segment\s+Reporting|Segment\s+Information|Notes\s+to\s+the\s+Financial|Segment\s+Performance|Financial\s+Highlights/i,
-              "Appendix": /Appendix|Financial\s+Summary|Key\s+Figures|Financial\s+Appendix/i
+               "Income Statement": /(?:Consolidated\s+)?(?:Statement\s+of\s+)?(?:Comprehensive\s+)?Income|Income\s+Statement|Financial\s+Overview|P&L|Profit\s+and\s+Loss|Financial\s+Performance/i,
+               "Balance Sheet": /(?:Consolidated\s+)?Balance\s+Sheet|(?:Statement\s+of\s+)?Financial\s+Position/i,
+               "Cash Flows": /(?:Consolidated\s+)?Statement(?:s)?\s+of\s+Cash\s+Flows|Cash\s+Flow/i,
+               "MD&A": /Management[''']?s\s+Discussion|MD&A|Business\s+Review|CEO\s+Update/i,
+               "Segment Notes": /Segment\s+Reporting|Segment\s+Information|Notes\s+to\s+the\s+Financial|Segment\s+Performance|Financial\s+Highlights/i,
+               // Updated per instructions for slide decks & presentations
+               "Appendix": /(?:Financial\s+)?Appendix|Key\s+Figures|Full\s+Year\s+Results|Summary\s+Tables/i
             };
 
             let foundSections: string[] = [];
             let targetPages: number[] = [];
+            let earlyExit = false;
 
             // 2. Iterate through PDF pages locally
             try {
@@ -178,9 +179,11 @@ export default function App() {
               const pdf = await loadingTask.promise;
 
               for (let p = 1; p <= totalPages; p++) {
+                if (earlyExit) break;
+
                 const page = await pdf.getPage(p);
                 const textContent = await page.getTextContent();
-                const pageText = textContent.items.map((item: any) => item.str).join(" ");
+                const pageText = textContent.items.map((item: any) => item.str).join("  ");
                 const idx = p - 1;
 
                 // 2a. Numeric Density Check (Presentation/Slide Deck Failsafe)
@@ -188,37 +191,54 @@ export default function App() {
                 const totalChars = pageText.length || 1;
                 const numericDensity = digits / totalChars;
 
-                if (numericDensity > 0.035) {
+                // FIX 1: Lower threshold to 0.02 (2%) to catch sparse tables
+                if (numericDensity > 0.02) {
                   targetPages.push(idx);
                   if (!foundSections.includes("Numeric Density Matrix")) {
                     foundSections.push("Numeric Density Matrix");
                   }
+                  
+                  // FIX 3: "Late-Doc Density" Heuristic
+                  // If density is hit after page 10, assume we've reached the financial block
+                  if (p > 10) {
+                    for (let overflowIdx = idx; overflowIdx < totalPages; overflowIdx++) {
+                      targetPages.push(overflowIdx);
+                    }
+                    foundSections.push("Late-Doc Density Trigger");
+                    earlyExit = true;
+                    break;
+                  }
                 }
 
                 // 2b. Test patterns for sections not yet found
-                Object.entries(sectionPatterns).forEach(([section, pattern]) => {
+                for (const [section, pattern] of Object.entries(sectionPatterns)) {
                   if (!foundSections.includes(section) && pattern.test(pageText)) {
                     foundSections.push(section);
                     
+                    // FIX 2: "Appendix Jump" Rule
                     if (section === "Appendix") {
-                      // Multi-Page Overflow Fix: Grab everything from here to the end
                       for (let overflowIdx = idx; overflowIdx < totalPages; overflowIdx++) {
                         targetPages.push(overflowIdx);
                       }
+                      earlyExit = true;
+                      break; // Stop pattern search
                     } else {
-                      // Add current page and next 2 pages (0-indexed)
+                      // Standard behavior: Add current page and next 2 pages (0-indexed)
                       targetPages.push(idx);
                       if (idx + 1 < totalPages) targetPages.push(idx + 1);
                       if (idx + 2 < totalPages) targetPages.push(idx + 2);
                     }
                   }
-                });
+                  if (earlyExit) break;
+                }
+                if (earlyExit) break; // Stop page scan early to save CPU
               }
             } catch (err) {
               console.warn("Local scan failed", err);
             }
 
             // 3. Slice the PDF
+            // FIX 5: Strict Deduplication & Numerical Sorting
             let finalIndices = [...new Set(targetPages)].sort((a, b) => a - b);
             
             // Debug Logging for triage
@@ -241,11 +261,9 @@ export default function App() {
             copiedPages.forEach(p => newDoc.addPage(p));
             const finalBuffer = await newDoc.save();
 
-            const base64 = btoa(
-              finalBuffer.reduce((data, byte) => data + String.fromCharCode(byte), "")
-            );
+            // FIX 4: Buffer Safety - base64 is ONLY used for the API call
+            const base64 = btoa(finalBuffer.reduce((data, byte) => data + String.fromCharCode(byte), ""));
 
-            // 4. Send to Gemini for deep extraction
             const deepPrompt = `Extract all financial tables in strict Markdown format and summarize the MD&A and segment notes from the attached pages.
             RULES:
             1. Start with YAML (ticker, company_name, doc_date, doc_type, extraction_confidence).
@@ -261,9 +279,11 @@ export default function App() {
               ] }]
             });
 
-            // 5. Update metadata block
+            // Explicitly isolate AI response to prevent base64 buffer leaks into dossier
+            const aiResponse = response.text || "No content extracted";
+            
             const metadata = `\n\n> **Scout Method**: Local Content-Aware Scan\n> **Sections Located**: ${foundSections.length > 0 ? foundSections.join(", ") : "Manual Triage Fallback (P1-15)"}\n> **Pages Processed**: ${finalIndices.length} out of ${totalPages}\n\n`;
-            extractedContent = (response.text || "No content extracted") + metadata;
+            extractedContent = aiResponse + metadata;
 
             // Usage Tracking
             if (response.usageMetadata) {
