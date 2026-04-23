@@ -121,7 +121,7 @@ export default function App() {
   const processFiles = async () => {
     if (files.length === 0 || !user) return;
     if (!ai) {
-      setError("GEMINI_API_KEY is missing. Please ensure you have added a 'GEMINI_API_KEY' secret in the AI Studio Settings (top right gear icon).");
+      setError("GEMINI_API_KEY is missing. Please ensure you have added a 'GEMINI_API_KEY' secret in the AI Studio Settings.");
       return;
     }
     setIsProcessing(true);
@@ -150,7 +150,6 @@ export default function App() {
           let extractedContent = "";
 
           if (isTxt) {
-            // Verbatim bypass for transcripts
             extractedContent = await file.text();
             combinedAuditLog.push({ filename: file.name, status: "processed", qa: "Verbatim Import" });
           } else if (isPdf) {
@@ -158,22 +157,20 @@ export default function App() {
             const srcDoc = await PDFDocument.load(arrayBuffer);
             const totalPages = srcDoc.getPageCount();
 
-            // 1. Define target sections and Regex patterns
+            // 1. Updated Regex Dictionary with "Aggressive Appendix" support
             const sectionPatterns = {
                "Income Statement": /(?:Consolidated\s+)?(?:Statement\s+of\s+)?(?:Comprehensive\s+)?Income|Income\s+Statement|Financial\s+Overview|P&L|Profit\s+and\s+Loss|Financial\s+Performance/i,
-               "Balance Sheet": /(?:Consolidated\s+)?Balance\s+Sheet|(?:Statement\s+of\s+)?Financial\s+Position/i,
+               "Balance Sheet": /(?:Consolidated\s+)?Balance\s+Sheet|(?:Statement\s+)?Financial\s+Position/i,
                "Cash Flows": /(?:Consolidated\s+)?Statement(?:s)?\s+of\s+Cash\s+Flows|Cash\s+Flow/i,
-               "MD&A": /Management[''']?s\s+Discussion|MD&A|Business\s+Review|CEO\s+Update/i,
+               "MD&A": /Management['''']?s\s+Discussion|MD&A|Business\s+Review|CEO\s+Update/i,
                "Segment Notes": /Segment\s+Reporting|Segment\s+Information|Notes\s+to\s+the\s+Financial|Segment\s+Performance|Financial\s+Highlights/i,
-               // Updated per instructions for slide decks & presentations
-               "Appendix": /(?:Financial\s+)?Appendix|Key\s+Figures|Full\s+Year\s+Results|Summary\s+Tables/i
+               "Appendix": /(?:Financial\s+)?Appendix|Key\s+Figures|Full\s+Year\s+Results|Summary\s+Tables|Financial\s+Summary/i
             };
 
             let foundSections: string[] = [];
             let targetPages: number[] = [];
             let earlyExit = false;
 
-            // 2. Iterate through PDF pages locally
             try {
               const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer, verbosity: 0 });
               const pdf = await loadingTask.promise;
@@ -186,44 +183,43 @@ export default function App() {
                 const pageText = textContent.items.map((item: any) => item.str).join("  ");
                 const idx = p - 1;
 
-                // 2a. Numeric Density Check (Presentation/Slide Deck Failsafe)
+                // 2. Numeric Density Upgrade (0.02 Threshold)
                 const digits = (pageText.match(/\d/g) || []).length;
                 const totalChars = pageText.length || 1;
                 const numericDensity = digits / totalChars;
 
-                // FIX 1: Lower threshold to 0.02 (2%) to catch sparse tables
                 if (numericDensity > 0.02) {
                   targetPages.push(idx);
                   if (!foundSections.includes("Numeric Density Matrix")) {
                     foundSections.push("Numeric Density Matrix");
                   }
                   
-                  // FIX 3: "Late-Doc Density" Heuristic
-                  // If density is hit after page 10, assume we've reached the financial block
+                  // 2a. Late-Doc Heuristic: If density hit after p10, grab all remaining
                   if (p > 10) {
                     for (let overflowIdx = idx; overflowIdx < totalPages; overflowIdx++) {
                       targetPages.push(overflowIdx);
                     }
-                    foundSections.push("Late-Doc Density Trigger");
+                    foundSections.push("Late-Doc Density Trigger (All Remaining)");
                     earlyExit = true;
                     break;
                   }
                 }
 
-                // 2b. Test patterns for sections not yet found
+                // 3. Regex Scanner & Aggressive Appendix Rule
                 for (const [section, pattern] of Object.entries(sectionPatterns)) {
-                  if (!foundSections.includes(section) && pattern.test(pageText)) {
-                    foundSections.push(section);
+                  if (pattern.test(pageText)) {
+                    if (!foundSections.includes(section)) foundSections.push(section);
                     
-                    // FIX 2: "Appendix Jump" Rule
                     if (section === "Appendix") {
+                      // CRITICAL: Aggressive Appendix Rule - Capture all remaining pages
                       for (let overflowIdx = idx; overflowIdx < totalPages; overflowIdx++) {
                         targetPages.push(overflowIdx);
                       }
+                      foundSections.push("Aggressive Appendix Capture");
                       earlyExit = true;
-                      break; // Stop pattern search
+                      break; 
                     } else {
-                      // Standard behavior: Add current page and next 2 pages (0-indexed)
+                      // Standard capture: Target page + next 2 for context
                       targetPages.push(idx);
                       if (idx + 1 < totalPages) targetPages.push(idx + 1);
                       if (idx + 2 < totalPages) targetPages.push(idx + 2);
@@ -231,26 +227,15 @@ export default function App() {
                   }
                   if (earlyExit) break;
                 }
-                if (earlyExit) break; // Stop page scan early to save CPU
               }
             } catch (err) {
               console.warn("Local scan failed", err);
             }
 
-            // 3. Slice the PDF
-            // FIX 5: Strict Deduplication & Numerical Sorting
+            // 4. Strict Deduplication & Numerical Sorting
             let finalIndices = [...new Set(targetPages)].sort((a, b) => a - b);
             
-            // Debug Logging for triage
-            if (finalIndices.length === 0) {
-              console.log("Scanner failed match. Diagnostics:", { 
-                targetPagesLength: targetPages.length, 
-                foundSections, 
-                totalPages 
-              });
-            }
-
-            // Fallback: If no sections found after both Regex and Density checks
+            // Manual Triage Fallback if all logic fails
             if (finalIndices.length === 0) {
               finalIndices = Array.from({ length: Math.min(15, totalPages) }, (_, i) => i);
               foundSections = ["Manual Triage Fallback (P1-15)"];
@@ -261,14 +246,13 @@ export default function App() {
             copiedPages.forEach(p => newDoc.addPage(p));
             const finalBuffer = await newDoc.save();
 
-            // FIX 4: Buffer Safety - base64 is ONLY used for the API call
             const base64 = btoa(finalBuffer.reduce((data, byte) => data + String.fromCharCode(byte), ""));
 
             const deepPrompt = `Extract all financial tables in strict Markdown format and summarize the MD&A and segment notes from the attached pages.
             RULES:
             1. Start with YAML (ticker, company_name, doc_date, doc_type, extraction_confidence).
             2. Convert all financial tables to strict GFM Markdown tables. Do not summarize tables.
-            3. Accuracy is critical. Preserve all financial values.
+            3. Preserve all financial values exactly as they appear.
             4. Output ONLY Markdown.`;
 
             const response = await ai.models.generateContent({
@@ -279,13 +263,10 @@ export default function App() {
               ] }]
             });
 
-            // Explicitly isolate AI response to prevent base64 buffer leaks into dossier
             const aiResponse = response.text || "No content extracted";
-            
-            const metadata = `\n\n> **Scout Method**: Local Content-Aware Scan\n> **Sections Located**: ${foundSections.length > 0 ? foundSections.join(", ") : "Manual Triage Fallback (P1-15)"}\n> **Pages Processed**: ${finalIndices.length} out of ${totalPages}\n\n`;
+            const metadata = `\n\n> **Scout Method**: Local Content-Aware Scan\n> **Sections Located**: ${foundSections.join(", ")}\n> **Pages Processed**: ${finalIndices.length} out of ${totalPages}\n\n`;
             extractedContent = aiResponse + metadata;
 
-            // Usage Tracking
             if (response.usageMetadata) {
               const { promptTokenCount = 0, candidatesTokenCount = 0 } = response.usageMetadata;
               runningCost += (promptTokenCount * FLASH_LITE_IN) + (candidatesTokenCount * FLASH_LITE_OUT);
@@ -293,13 +274,11 @@ export default function App() {
               combinedAuditLog.push({ 
                 filename: file.name, 
                 status: "processed", 
-                qa: `Local Scanned (${finalIndices.length} pgs)`,
+                qa: `Scanned (${finalIndices.length} pgs)`,
                 tokens: { prompt: promptTokenCount, candidates: candidatesTokenCount }
               });
             }
           } else {
-            // Non-PDF/Text fallback
-            extractedContent = `[Format ${contentType} not natively parsed in local bypass mode]`;
             combinedAuditLog.push({ filename: file.name, status: "skipped", reason: "Format not supported" });
             summary.skipped++;
             continue;
