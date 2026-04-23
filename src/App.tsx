@@ -161,24 +161,42 @@ export default function App() {
             const srcDoc = await PDFDocument.load(arrayBuffer);
             const totalPages = srcDoc.getPageCount();
             
-            // --- PASS 1: THE SCOUT (Header Sampling) ---
+            // --- PASS 1: THE SCOUT (TOC + Header Sampling) ---
             let headerMap = "";
+            let primaryTOCData = "";
             let consolidatedPages: number[] = [];
+            let scoutMethod = "Header Scan";
+            
             try {
               const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer, verbosity: 0 });
               const pdf = await loadingTask.promise;
               
-              // Sample EVERY page (header only) to find deep sections
+              const tocSearchLimit = Math.min(10, totalPages);
+              
+              // Sample EVERY page
               for (let p = 1; p <= totalPages; p++) {
                 const page = await pdf.getPage(p);
                 const textContent = await page.getTextContent();
                 const pageText = textContent.items.map((item: any) => item.str).join(" ");
-                const header = pageText.slice(0, 200); // 200 character header sample
                 
+                // 1. TOC Priority Search (First 10 pages)
+                if (p <= tocSearchLimit && !primaryTOCData) {
+                  const lowerText = pageText.toLowerCase();
+                  if (lowerText.includes("table of contents") || lowerText.includes("contents")) {
+                    if (lowerText.includes("income statement") || lowerText.includes("balance sheet") || lowerText.includes("cash flows")) {
+                      primaryTOCData = `PRIMARY TOC DATA (Page ${p}): ${pageText}\n`;
+                      scoutMethod = "TOC Match";
+                    }
+                  }
+                }
+
+                // 2. Sample 1000 characters for all pages
+                const header = pageText.slice(0, 1000); 
                 headerMap += `Page ${p}: ${header}\n`;
                 
-                // Early fallback detection for important keywords
-                if (header.toLowerCase().includes("consolidated")) {
+                // 3. Early detection for fallback
+                const lowerHeader = header.toLowerCase();
+                if (lowerHeader.includes("consolidated") || lowerHeader.includes("statement of cash flows")) {
                   consolidatedPages.push(p - 1);
                 }
               }
@@ -188,20 +206,26 @@ export default function App() {
 
             let targetPages: number[] = [];
             let foundSections: string[] = [];
-            let scoutDebug = "";
 
             // Only run the AI Scout if we successfully extracted local text
             if (headerMap.trim().length > 50) {
-              const scoutPrompt = `Analyze this map of page headers from an annual report. 
-              Identify the exact page numbers for: 
+              const scoutPrompt = `Analyze this map of page headers and potential Table of Contents (TOC) from an annual report. 
+              Your goal is to identify the EXACT page numbers/ranges for the Financial Statements and Segment Notes.
+              
+              Identify pages for: 
               1. Consolidated Income Statement
               2. Balance Sheet
               3. Cash Flow Statement
               4. Segment Reporting/Notes
               
+              ${primaryTOCData}
+              
+              If the TOC explicitly says 'Income Statement... 30', ensure page 30 is included. 
+              Include the full statements and notes.
+              
               RETURN ONLY A JSON OBJECT: {"pages": [list of unique page numbers], "sections": ["found names"]}. 
-              Be exact. Use the page numbers as provided in the map.
-              MAP: ${headerMap.slice(0, 100000)}`;
+              Be exact.
+              HEADER MAP: ${headerMap.slice(0, 100000)}`;
 
               try {
                 const scoutResponse = await ai.models.generateContent({
@@ -209,11 +233,10 @@ export default function App() {
                   contents: [{ role: "user", parts: [{ text: scoutPrompt }] }]
                 });
 
-                scoutDebug = scoutResponse.text.replace(/```json|```/g, "").trim();
+                const scoutDebug = scoutResponse.text.replace(/```json|```/g, "").trim();
                 const scoutJsonMatch = scoutDebug.match(/\{[\s\S]*\}/);
                 if (scoutJsonMatch) {
                   const scoutResult = JSON.parse(scoutJsonMatch[0]);
-                  // Convert 1-indexed (from AI) to 0-indexed (for pdf-lib) safely
                   targetPages = [...new Set(scoutResult.pages as number[])]
                     .map(p => p - 1) 
                     .filter(p => p >= 0 && p < totalPages)
@@ -226,12 +249,15 @@ export default function App() {
             }
 
             // --- FAILSAFE ASSEMBLY ---
-            // If scout found nothing, default to pages [0, 1, 2] AND any detected "Consolidated" pages
             if (targetPages.length === 0) {
-                targetPages = [...new Set([0, 1, 2, ...consolidatedPages])]
-                  .filter(p => p < totalPages)
+                // Failsafe Logic: 1-5 (TOC), 25-45 (Main Stats), plus any "Consolidated" keyword detection
+                const introPages = Array.from({ length: Math.min(5, totalPages) }, (_, i) => i);
+                const statsPages = Array.from({ length: 21 }, (_, i) => i + 24).filter(p => p < totalPages);
+                
+                targetPages = [...new Set([...introPages, ...statsPages, ...consolidatedPages])]
                   .sort((a, b) => a - b);
-                foundSections = ["Structural Fallback (P1-3 + Consolidated)"];
+                foundSections = ["Structural Fallback (P1-5, P25-45, Keywords)"];
+                scoutMethod = "Fallback";
             }
 
             // --- PASS 2: TARGETED EXTRACTION ---
@@ -260,7 +286,7 @@ export default function App() {
               ] }]
             });
 
-            const metadata = `\n\n> **Extraction Strategy**: Targeted Anchor-Driven\n> **Pages Processed**: ${targetPages.length} out of ${totalPages}\n> **Sections Located**: ${foundSections.join(", ")}\n\n`;
+            const metadata = `\n\n> **Extraction Strategy**: Targeted Anchor-Driven\n> **Scout Method**: ${scoutMethod}\n> **Pages Processed**: ${targetPages.length} out of ${totalPages}\n> **Sections Located**: ${foundSections.join(", ")}\n\n`;
             extractedContent = (response.text || "No content extracted") + metadata;
 
             // Usage Tracking
