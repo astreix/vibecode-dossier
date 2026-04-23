@@ -156,56 +156,65 @@ export default function App() {
             combinedAuditLog.push({ filename: file.name, status: "processed", qa: "Verbatim Import" });
           } else if (isPdf) {
             const arrayBuffer = await file.arrayBuffer();
-            const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer, verbosity: 0 });
-            const pdf = await loadingTask.promise;
-            const totalPages = pdf.numPages;
+            
+            // 1. Get exact total pages from the highly reliable pdf-lib first
+            const srcDoc = await PDFDocument.load(arrayBuffer);
+            const totalPages = srcDoc.getPageCount();
             
             // --- PASS 1: THE SCOUT ---
-            // Extract text from first 15 pages to find the Table of Contents
             let tocText = "";
-            const scanLimit = Math.min(15, totalPages);
-            for (let p = 1; p <= scanLimit; p++) {
-              const page = await pdf.getPage(p);
-              const textContent = await page.getTextContent();
-              tocText += `--- Page ${p} ---\n` + textContent.items.map((item: any) => item.str).join(" ") + "\n";
+            try {
+              const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer, verbosity: 0 });
+              const pdf = await loadingTask.promise;
+              const scanLimit = Math.min(15, totalPages);
+              for (let p = 1; p <= scanLimit; p++) {
+                const page = await pdf.getPage(p);
+                const textContent = await page.getTextContent();
+                tocText += `--- Page ${p} ---\n` + textContent.items.map((item: any) => item.str).join(" ") + "\n";
+              }
+            } catch (textErr) {
+              console.warn("Local text extraction blocked, skipping scout", textErr);
             }
-
-            const scoutPrompt = `Review this Table of Contents/Intro text from a financial report. 
-            Identify the exact page numbers for: MD&A, Income Statement, Balance Sheet, Cash Flow, and Segment/Financial Notes.
-            RETURN ONLY A JSON OBJECT: {"pages": [1, 2, 3, 4, 5], "sections": ["MD&A", "Balance Sheet"]}.
-            Convert section names to 0-indexed page numbers.
-            TEXT: ${tocText}`;
-
-            const scoutResponse = await ai.models.generateContent({
-              model: "gemini-2.5-flash-lite",
-              contents: [{ role: "user", parts: [{ text: scoutPrompt }] }]
-            });
 
             let targetPages: number[] = [];
             let foundSections: string[] = [];
             let scoutDebug = "";
-            
-            try {
-              scoutDebug = scoutResponse.text.replace(/```json|```/g, "").trim();
-              const scoutResult = JSON.parse(scoutDebug);
-              // Ensure we have unique, valid, 0-indexed page numbers
-              targetPages = [...new Set(scoutResult.pages as number[])]
-                .filter(p => p >= 0 && p < totalPages)
-                .sort((a, b) => a - b);
-              foundSections = scoutResult.sections || [];
-            } catch (e) {
-              console.warn("Scout parse failed, falling back to P1-15", e);
-              targetPages = Array.from({ length: Math.min(15, totalPages) }, (_, i) => i);
-              foundSections = ["Manual Triage Fallback (P1-15)"];
+
+            // Only run the AI Scout if we successfully extracted local text
+            if (tocText.trim().length > 50) {
+              const scoutPrompt = `Review this Table of Contents/Intro text from a financial report. 
+              Identify the exact page numbers for: MD&A, Income Statement, Balance Sheet, Cash Flow, and Segment/Financial Notes.
+              RETURN ONLY A JSON OBJECT: {"pages": [1, 2, 3, 4], "sections": ["MD&A", "Balance Sheet"]}.
+              Use the exact page numbers written in the text. DO NOT modify or subtract 1 from the numbers.
+              TEXT: ${tocText}`;
+
+              try {
+                const scoutResponse = await ai.models.generateContent({
+                  model: "gemini-2.5-flash-lite",
+                  contents: [{ role: "user", parts: [{ text: scoutPrompt }] }]
+                });
+
+                scoutDebug = scoutResponse.text.replace(/```json|```/g, "").trim();
+                const scoutResult = JSON.parse(scoutDebug);
+                
+                // Convert 1-indexed (from AI) to 0-indexed (for pdf-lib) safely in JS
+                targetPages = [...new Set(scoutResult.pages as number[])]
+                  .map(p => p - 1) 
+                  .filter(p => p >= 0 && p < totalPages)
+                  .sort((a, b) => a - b);
+                foundSections = scoutResult.sections || [];
+              } catch (e) {
+                console.warn("Scout parse failed, falling back", e);
+              }
             }
 
             // --- PASS 2: TARGETED EXTRACTION ---
-            const srcDoc = await PDFDocument.load(arrayBuffer);
             const newDoc = await PDFDocument.create();
             
-            // If scout found nothing, default to first 15
+            // Fallback: If scout found nothing, default to first 15 pages
             if (targetPages.length === 0) {
                 targetPages = Array.from({ length: Math.min(15, totalPages) }, (_, i) => i);
+                foundSections = ["Manual Triage Fallback (P1-15)"];
             }
 
             const copiedPages = await newDoc.copyPages(srcDoc, targetPages);
