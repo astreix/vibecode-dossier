@@ -156,113 +156,60 @@ export default function App() {
             combinedAuditLog.push({ filename: file.name, status: "processed", qa: "Verbatim Import" });
           } else if (isPdf) {
             const arrayBuffer = await file.arrayBuffer();
-            
-            // 1. Get exact total pages from the highly reliable pdf-lib first
             const srcDoc = await PDFDocument.load(arrayBuffer);
             const totalPages = srcDoc.getPageCount();
-            
-            // --- PASS 1: THE SCOUT (TOC + Header Sampling) ---
-            let headerMap = "";
-            let primaryTOCData = "";
-            let consolidatedPages: number[] = [];
-            let scoutMethod = "Header Scan";
-            
+
+            // 1. Define target sections and Regex patterns
+            const sectionPatterns = {
+              "Income Statement": /(?:Consolidated\s+)?Statement(?:s)?\s+of\s+(?:Comprehensive\s+)?Income|Income\s+Statement/i,
+              "Balance Sheet": /(?:Consolidated\s+)?Balance\s+Sheet|(?:Statement\s+of\s+)?Financial\s+Position/i,
+              "Cash Flows": /(?:Consolidated\s+)?Statement(?:s)?\s+of\s+Cash\s+Flows/i,
+              "MD&A": /Management[''’]?s\s+Discussion\s+and\s+Analysis/i,
+              "Segment Notes": /Segment\s+Reporting|Segment\s+Information|Notes\s+to\s+the\s+Financial/i
+            };
+
+            const foundSections = new Set<string>();
+            const targetPageIndices = new Set<number>();
+
+            // 2. Iterate through PDF pages locally
             try {
               const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer, verbosity: 0 });
               const pdf = await loadingTask.promise;
-              
-              const tocSearchLimit = Math.min(10, totalPages);
-              
-              // Sample EVERY page
+
               for (let p = 1; p <= totalPages; p++) {
                 const page = await pdf.getPage(p);
                 const textContent = await page.getTextContent();
                 const pageText = textContent.items.map((item: any) => item.str).join(" ");
-                
-                // 1. TOC Priority Search (First 10 pages)
-                if (p <= tocSearchLimit && !primaryTOCData) {
-                  const lowerText = pageText.toLowerCase();
-                  if (lowerText.includes("table of contents") || lowerText.includes("contents")) {
-                    if (lowerText.includes("income statement") || lowerText.includes("balance sheet") || lowerText.includes("cash flows")) {
-                      primaryTOCData = `PRIMARY TOC DATA (Page ${p}): ${pageText}\n`;
-                      scoutMethod = "TOC Match";
-                    }
+
+                // Test patterns for sections not yet found
+                Object.entries(sectionPatterns).forEach(([section, pattern]) => {
+                  if (!foundSections.has(section) && pattern.test(pageText)) {
+                    foundSections.add(section);
+                    // Add current page and next 2 pages (0-indexed)
+                    const idx = p - 1;
+                    targetPageIndices.add(idx);
+                    if (idx + 1 < totalPages) targetPageIndices.add(idx + 1);
+                    if (idx + 2 < totalPages) targetPageIndices.add(idx + 2);
                   }
-                }
-
-                // 2. Sample 1000 characters for all pages
-                const header = pageText.slice(0, 1000); 
-                headerMap += `Page ${p}: ${header}\n`;
-                
-                // 3. Early detection for fallback
-                const lowerHeader = header.toLowerCase();
-                if (lowerHeader.includes("consolidated") || lowerHeader.includes("statement of cash flows")) {
-                  consolidatedPages.push(p - 1);
-                }
-              }
-            } catch (textErr) {
-              console.warn("Local text extraction blocked, skipping scout", textErr);
-            }
-
-            let targetPages: number[] = [];
-            let foundSections: string[] = [];
-
-            // Only run the AI Scout if we successfully extracted local text
-            if (headerMap.trim().length > 50) {
-              const scoutPrompt = `Analyze this map of page headers and potential Table of Contents (TOC) from an annual report. 
-              Your goal is to identify the EXACT page numbers/ranges for the Financial Statements and Segment Notes.
-              
-              Identify pages for: 
-              1. Consolidated Income Statement
-              2. Balance Sheet
-              3. Cash Flow Statement
-              4. Segment Reporting/Notes
-              
-              ${primaryTOCData}
-              
-              If the TOC explicitly says 'Income Statement... 30', ensure page 30 is included. 
-              Include the full statements and notes.
-              
-              RETURN ONLY A JSON OBJECT: {"pages": [list of unique page numbers], "sections": ["found names"]}. 
-              Be exact.
-              HEADER MAP: ${headerMap.slice(0, 100000)}`;
-
-              try {
-                const scoutResponse = await ai.models.generateContent({
-                  model: "gemini-2.5-flash-lite",
-                  contents: [{ role: "user", parts: [{ text: scoutPrompt }] }]
                 });
 
-                const scoutDebug = scoutResponse.text.replace(/```json|```/g, "").trim();
-                const scoutJsonMatch = scoutDebug.match(/\{[\s\S]*\}/);
-                if (scoutJsonMatch) {
-                  const scoutResult = JSON.parse(scoutJsonMatch[0]);
-                  targetPages = [...new Set(scoutResult.pages as number[])]
-                    .map(p => p - 1) 
-                    .filter(p => p >= 0 && p < totalPages)
-                    .sort((a, b) => a - b);
-                  foundSections = scoutResult.sections || [];
-                }
-              } catch (e) {
-                console.warn("Scout parse failed, falling back", e);
+                // Optimization: Break if all sections found
+                if (foundSections.size === Object.keys(sectionPatterns).length) break;
               }
+            } catch (err) {
+              console.warn("Local scan failed", err);
             }
 
-            // --- FAILSAFE ASSEMBLY ---
-            if (targetPages.length === 0) {
-                // Failsafe Logic: 1-5 (TOC), 25-45 (Main Stats), plus any "Consolidated" keyword detection
-                const introPages = Array.from({ length: Math.min(5, totalPages) }, (_, i) => i);
-                const statsPages = Array.from({ length: 21 }, (_, i) => i + 24).filter(p => p < totalPages);
-                
-                targetPages = [...new Set([...introPages, ...statsPages, ...consolidatedPages])]
-                  .sort((a, b) => a - b);
-                foundSections = ["Structural Fallback (P1-5, P25-45, Keywords)"];
-                scoutMethod = "Fallback";
+            // 3. Slice the PDF
+            let finalIndices = Array.from(targetPageIndices).sort((a, b) => a - b);
+            
+            // Fallback: If no sections found, use first 15 pages
+            if (finalIndices.length === 0) {
+              finalIndices = Array.from({ length: Math.min(15, totalPages) }, (_, i) => i);
             }
 
-            // --- PASS 2: TARGETED EXTRACTION ---
             const newDoc = await PDFDocument.create();
-            const copiedPages = await newDoc.copyPages(srcDoc, targetPages);
+            const copiedPages = await newDoc.copyPages(srcDoc, finalIndices);
             copiedPages.forEach(p => newDoc.addPage(p));
             const finalBuffer = await newDoc.save();
 
@@ -270,13 +217,13 @@ export default function App() {
               finalBuffer.reduce((data, byte) => data + String.fromCharCode(byte), "")
             );
 
-            const deepPrompt = `Extract high-fidelity financial data from the attached pages.
+            // 4. Send to Gemini for deep extraction
+            const deepPrompt = `Extract all financial tables in strict Markdown format and summarize the MD&A and segment notes from the attached pages.
             RULES:
             1. Start with YAML (ticker, company_name, doc_date, doc_type, extraction_confidence).
-            2. Convert all financial tables to strict GFM Markdown tables. 
-            3. DO NOT truncate tables. If a table spans multiple pages, reconstruct it as a single continuous Markdown table.
-            4. Focus on MD&A insights and Segment Reporting details.
-            5. Output ONLY Markdown.`;
+            2. Convert all financial tables to strict GFM Markdown tables. Do not summarize tables.
+            3. Accuracy is critical. Preserve all financial values.
+            4. Output ONLY Markdown.`;
 
             const response = await ai.models.generateContent({
               model: AI_MODEL,
@@ -286,7 +233,8 @@ export default function App() {
               ] }]
             });
 
-            const metadata = `\n\n> **Extraction Strategy**: Targeted Anchor-Driven\n> **Scout Method**: ${scoutMethod}\n> **Pages Processed**: ${targetPages.length} out of ${totalPages}\n> **Sections Located**: ${foundSections.join(", ")}\n\n`;
+            // 5. Update metadata block
+            const metadata = `\n\n> **Scout Method**: Local Content-Aware Scan\n> **Sections Located**: ${foundSections.size > 0 ? Array.from(foundSections).join(", ") : "Manual Triage Fallback (P1-15)"}\n> **Pages Processed**: ${finalIndices.length} out of ${totalPages}\n\n`;
             extractedContent = (response.text || "No content extracted") + metadata;
 
             // Usage Tracking
@@ -297,7 +245,7 @@ export default function App() {
               combinedAuditLog.push({ 
                 filename: file.name, 
                 status: "processed", 
-                qa: `AI Targeted (${targetPages.length} pgs)`,
+                qa: `Local Scanned (${finalIndices.length} pgs)`,
                 tokens: { prompt: promptTokenCount, candidates: candidatesTokenCount }
               });
             }
