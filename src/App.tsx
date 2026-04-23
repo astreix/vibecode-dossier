@@ -155,94 +155,140 @@ export default function App() {
             extractedContent = await file.text();
             combinedAuditLog.push({ filename: file.name, status: "processed", qa: "Verbatim Import" });
           } else if (isPdf) {
-            // 1. Local Extraction Attempt (Main Thread)
-            let localText = "";
-            let pageCount = 0;
+            // --- Phase 1: Local TOC Extraction ---
+            let localTOCText = "";
+            let totalPdfPages = 0;
+            const arrayBuffer = await file.arrayBuffer();
             try {
-              const arrayBuffer = await file.arrayBuffer();
               const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer, verbosity: 0 });
               const pdf = await loadingTask.promise;
-              pageCount = pdf.numPages;
-              setProcessingStatus(prev => prev ? { ...prev, pdfPages: { current: 0, total: pageCount } } : null);
+              totalPdfPages = pdf.numPages;
+              setProcessingStatus(prev => prev ? { ...prev, pdfPages: { current: 0, total: totalPdfPages } } : null);
               
-              let fullText = "";
-              // Extract all pages locally to see if it's text-searchable
-              for (let p = 1; p <= pdf.numPages; p++) {
-                setProcessingStatus(prev => prev ? { ...prev, pdfPages: { current: p, total: pageCount } } : null);
+              // Extract first 15 pages for Scout pass text
+              const pagesToScout = Math.min(15, totalPdfPages);
+              let tempText = "";
+              for (let p = 1; p <= pagesToScout; p++) {
+                setProcessingStatus(prev => prev ? { ...prev, pdfPages: { current: p, total: totalPdfPages } } : null);
                 const page = await pdf.getPage(p);
                 const textContent = await page.getTextContent();
-                fullText += textContent.items.map((item: any) => item.str).join(" ") + " ";
+                tempText += `Page ${p}: ` + textContent.items.map((item: any) => item.str).join(" ") + "\n";
               }
-              localText = fullText.trim();
-            } catch (localErr) {
-              console.warn("Local PDF extraction failed/blocked - falling back to AI", localErr);
+              localTOCText = tempText.trim();
+            } catch (err) {
+              console.warn("Local TOC extraction failed", err);
             }
 
-            if (localText && localText.length > 500) {
-              // High confidence in local extraction
-              extractedContent = `### Local Extraction Fragment\n\n${localText}\n\n[Note: Local Parser matched >500 chars, AI bypass active for efficiency]`;
-              combinedAuditLog.push({ filename: file.name, status: "processed", qa: "Local Fallback (Main Thread)" });
-            } else {
-              // 2. Smart Scout Fallback (Gemini API with Page Limits)
-              const arrayBuffer = await file.arrayBuffer();
-              const srcDoc = await PDFDocument.load(arrayBuffer);
-              const totalPagesAtGemini = srcDoc.getPageCount();
-              setProcessingStatus(prev => prev ? { ...prev, pdfPages: { current: 0, total: totalPagesAtGemini } } : null);
+            // --- Phase 2: The LLM Scout Pass ---
+            let targetedPages: number[] = [];
+            let sectionsFound: string[] = [];
+            let rawScoutJson = "";
+
+            if (localTOCText) {
+              const scoutPrompt = `Analyze the provided Table of Contents / initial text from a financial document:
+              "${localTOCText.slice(0, 15000)}"
               
-              let finalBuffer: Uint8Array;
-              let note = "";
-
-              if (totalPagesAtGemini > 10) {
-                // Slice to first 10 pages for cost optimization
-                const newDoc = await PDFDocument.create();
-                const pagesToCopy = Array.from({ length: 10 }, (_, idx) => idx);
-                const copiedPages = await newDoc.copyPages(srcDoc, pagesToCopy);
-                copiedPages.forEach(p => newDoc.addPage(p));
-                finalBuffer = await newDoc.save();
-                note = `\n\n[Smart Scout Notice: Document was ${totalPagesAtGemini} pages. Clipped to first 10 pages for cost optimization.]`;
-              } else {
-                finalBuffer = new Uint8Array(arrayBuffer);
-              }
-
-              const base64 = btoa(
-                finalBuffer.reduce((data, byte) => data + String.fromCharCode(byte), "")
-              );
-
-              const prompt = `Extract high-fidelity financial data from ${file.name}.
-              RULES:
-              1. Start with YAML (ticker, company_name, doc_date, doc_type, extraction_confidence).
-              2. Convert tables to GFM Markdown. 
-              3. Preserve footnotes, units, currency symbols.
-              4. Output ONLY Markdown.`;
-
-              const parts = [
-                { inlineData: { mimeType: "application/pdf", data: base64 } },
-                { text: prompt }
-              ];
-
-              const response = await ai.models.generateContent({
-                model: AI_MODEL,
-                contents: [{ role: "user", parts }]
-              });
-
-              extractedContent = (response.text || "No content extracted") + note;
+              Identify the exact page numbers for the following sections: "MD&A", "Income Statement", "Balance Sheet", "Cash Flows", and "Segment Reporting".
               
-              // Tracking Token Usage & Cost
-              if (response.usageMetadata) {
-                const { promptTokenCount = 0, candidatesTokenCount = 0 } = response.usageMetadata;
-                const fileCost = (promptTokenCount * FLASH_LITE_IN) + (candidatesTokenCount * FLASH_LITE_OUT);
-                runningCost += fileCost;
-                setTotalCost(runningCost);
-                combinedAuditLog.push({ 
-                  filename: file.name, 
-                  status: "processed", 
-                  qa: `AI Processed (${totalPagesAtGemini > 10 ? 'Clipped' : 'Full'})`,
-                  tokens: { prompt: promptTokenCount, candidates: candidatesTokenCount }
+              Return ONLY a JSON object. No preamble. No explanation. 
+              Format: {"sections": [{"name": "MD&A", "pages": [5, 12]}], "all_relevant_pages": [5, 6, 7, 8, 9, 10, 11, 12, 15, 16]}
+              Note: Page numbers must be 1-indexed.`;
+
+              try {
+                const scoutResponse = await ai.models.generateContent({
+                  model: AI_MODEL,
+                  contents: [{ role: "user", parts: [{ text: scoutPrompt }] }]
                 });
-              } else {
-                combinedAuditLog.push({ filename: file.name, status: "processed", qa: `AI Processed (${totalPagesAtGemini > 10 ? 'Clipped' : 'Full'})` });
+                
+                rawScoutJson = scoutResponse.text || "{}";
+                
+                // Track Scout Cost
+                if (scoutResponse.usageMetadata) {
+                  const { promptTokenCount = 0, candidatesTokenCount = 0 } = scoutResponse.usageMetadata;
+                  runningCost += (promptTokenCount * FLASH_LITE_IN) + (candidatesTokenCount * FLASH_LITE_OUT);
+                  setTotalCost(runningCost);
+                }
+                
+                // Robust JSON Parsing
+                const cleanJson = rawScoutJson.replace(/```json|```/g, "").trim();
+                const scoutJsonMatch = cleanJson.match(/\{[\s\S]*\}/);
+                
+                if (scoutJsonMatch) {
+                  const scoutData = JSON.parse(scoutJsonMatch[0]);
+                  targetedPages = scoutData.all_relevant_pages || [];
+                  sectionsFound = (scoutData.sections || [])
+                    .filter((s: any) => s.pages && s.pages.length > 0)
+                    .map((s: any) => s.name);
+                }
+              } catch (scoutErr) {
+                console.error("Scout pass failed/JSON invalid", scoutErr);
               }
             }
+
+            // --- Phase 3: Targeted Slicing ---
+            // Sanitize: unique, sorted, and bound to actual PDF pages
+            targetedPages = [...new Set(targetedPages)]
+              .filter(p => p > 0 && p <= totalPdfPages)
+              .sort((a, b) => a - b);
+
+            // Fallback: If scout failed or returned empty array, 1-15
+            let indicesToCopy = targetedPages.map(p => p - 1);
+            if (indicesToCopy.length === 0) {
+              indicesToCopy = Array.from({ length: Math.min(15, totalPdfPages) }, (_, i) => i);
+              targetedPages = indicesToCopy.map(i => i + 1); // Update for metadata
+            }
+
+            const srcDoc = await PDFDocument.load(arrayBuffer);
+            const targetedDoc = await PDFDocument.create();
+            // copyPages takes 0-indexed indices
+            const copiedPages = await targetedDoc.copyPages(srcDoc, indicesToCopy);
+            copiedPages.forEach(p => targetedDoc.addPage(p));
+            const targetedBuffer = await targetedDoc.save();
+
+            const base64 = btoa(
+              targetedBuffer.reduce((data, byte) => data + String.fromCharCode(byte), "")
+            );
+
+            // --- Phase 4: Deep Extraction & Metadata ---
+            const extractionPrompt = `Extract high-fidelity financial data from the provided document batch.
+            RULES:
+            1. Start with YAML (ticker: ${ticker || 'UNKWN'}, company_name, doc_date, doc_type, extraction_confidence).
+            2. Convert all financial tables to exact GFM Markdown tables. Do not summarize tables. Preserve ALL rows and columns.
+            3. Preserve footnotes, units, currency symbols.
+            4. Output ONLY Markdown.`;
+
+            const extractParts = [
+              { inlineData: { mimeType: "application/pdf", data: base64 } },
+              { text: extractionPrompt }
+            ];
+
+            const extractResponse = await ai.models.generateContent({
+              model: AI_MODEL,
+              contents: [{ role: "user", parts: extractParts }]
+            });
+
+            let extractionTokens = { prompt: 0, candidates: 0 };
+            if (extractResponse.usageMetadata) {
+              const { promptTokenCount = 0, candidatesTokenCount = 0 } = extractResponse.usageMetadata;
+              extractionTokens = { prompt: promptTokenCount, candidates: candidatesTokenCount };
+              runningCost += (promptTokenCount * FLASH_LITE_IN) + (candidatesTokenCount * FLASH_LITE_OUT);
+              setTotalCost(runningCost);
+            }
+
+            const qaMeta = `> **Extraction Strategy**: Targeted Anchor-Driven
+> **Pages Processed**: ${targetedPages.length} out of ${totalPdfPages}
+> **Sections Successfully Located**: ${sectionsFound.length > 0 ? sectionsFound.join(", ") : "Manual Triage Fallback (P1-15)"}
+> **Scout Debug JSON**: \`${rawScoutJson.replace(/\n/g, ' ')}\`
+
+\n\n`;
+
+            extractedContent = qaMeta + (extractResponse.text || "No content extracted");
+            combinedAuditLog.push({ 
+              filename: file.name, 
+              status: "processed", 
+              qa: sectionsFound.length > 0 ? "Targeted Success" : "Fallback Mode",
+              tokens: extractionTokens
+            });
           } else {
             // Non-PDF/Text fallback
             extractedContent = `[Format ${contentType} not natively parsed in local bypass mode]`;
