@@ -159,13 +159,13 @@ export default function App() {
             const srcDoc = await PDFDocument.load(arrayBuffer);
             const totalPages = srcDoc.getPageCount();
 
-            // 1. Define target sections and Regex patterns
+            // 1. Define target sections and Regex patterns (Expanded for presentations)
             const sectionPatterns = {
-              "Income Statement": /(?:Consolidated\s+)?Statement(?:s)?\s+of\s+(?:Comprehensive\s+)?Income|Income\s+Statement/i,
+              "Income Statement": /(?:Consolidated\s+)?(?:Statement\s+of\s+)?(?:Comprehensive\s+)?Income|Income\s+Statement|Financial\s+Overview|P&L|Profit\s+and\s+Loss|Financial\s+Performance/i,
               "Balance Sheet": /(?:Consolidated\s+)?Balance\s+Sheet|(?:Statement\s+of\s+)?Financial\s+Position/i,
-              "Cash Flows": /(?:Consolidated\s+)?Statement(?:s)?\s+of\s+Cash\s+Flows/i,
-              "MD&A": /Management[''’]?s\s+Discussion\s+and\s+Analysis/i,
-              "Segment Notes": /Segment\s+Reporting|Segment\s+Information|Notes\s+to\s+the\s+Financial/i
+              "Cash Flows": /(?:Consolidated\s+)?Statement(?:s)?\s+of\s+Cash\s+Flows|Cash\s+Flow/i,
+              "MD&A": /Management['''’]?s\s+Discussion|MD&A|Business\s+Review|CEO\s+Update/i,
+              "Segment Notes": /Segment\s+Reporting|Segment\s+Information|Notes\s+to\s+the\s+Financial|Segment\s+Performance|Financial\s+Highlights/i
             };
 
             const foundSections = new Set<string>();
@@ -180,13 +180,23 @@ export default function App() {
                 const page = await pdf.getPage(p);
                 const textContent = await page.getTextContent();
                 const pageText = textContent.items.map((item: any) => item.str).join(" ");
+                const idx = p - 1;
 
-                // Test patterns for sections not yet found
+                // 2a. Numeric Density Check (Presentation/Slide Deck Failsafe)
+                const digits = (pageText.match(/\d/g) || []).length;
+                const totalChars = pageText.length || 1;
+                const numericDensity = digits / totalChars;
+
+                if (numericDensity > 0.06) {
+                  targetPageIndices.add(idx);
+                  foundSections.add("Numeric Density Matrix (Table Detected)");
+                }
+
+                // 2b. Test patterns for sections not yet found
                 Object.entries(sectionPatterns).forEach(([section, pattern]) => {
                   if (!foundSections.has(section) && pattern.test(pageText)) {
                     foundSections.add(section);
                     // Add current page and next 2 pages (0-indexed)
-                    const idx = p - 1;
                     targetPageIndices.add(idx);
                     if (idx + 1 < totalPages) targetPageIndices.add(idx + 1);
                     if (idx + 2 < totalPages) targetPageIndices.add(idx + 2);
@@ -194,7 +204,13 @@ export default function App() {
                 });
 
                 // Optimization: Break if all sections found
-                if (foundSections.size === Object.keys(sectionPatterns).length) break;
+                if (foundSections.size === (Object.keys(sectionPatterns).length + (foundSections.has("Numeric Density Matrix (Table Detected)") ? 1 : 0))) {
+                  // We don't really want to break early if we are hunting for specific sections 
+                  // but density check keeps adding itself. 
+                  // Let's just check if all regex patterns are matched.
+                  const allRegexMatched = Object.keys(sectionPatterns).every(s => foundSections.has(s));
+                  if (allRegexMatched) break;
+                }
               }
             } catch (err) {
               console.warn("Local scan failed", err);
@@ -203,7 +219,7 @@ export default function App() {
             // 3. Slice the PDF
             let finalIndices = Array.from(targetPageIndices).sort((a, b) => a - b);
             
-            // Fallback: If no sections found, use first 15 pages
+            // Fallback: If no sections found after both Regex and Density checks
             if (finalIndices.length === 0) {
               finalIndices = Array.from({ length: Math.min(15, totalPages) }, (_, i) => i);
             }
