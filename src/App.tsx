@@ -201,7 +201,7 @@ export default function App() {
               
               RETURN ONLY A JSON OBJECT: {"pages": [list of unique page numbers], "sections": ["found names"]}. 
               Be exact. Use the page numbers as provided in the map.
-              MAP: ${headerMap.slice(0, 30000)}`;
+              MAP: ${headerMap.slice(0, 100000)}`;
 
               try {
                 const scoutResponse = await ai.models.generateContent({
