@@ -161,16 +161,26 @@ export default function App() {
             const srcDoc = await PDFDocument.load(arrayBuffer);
             const totalPages = srcDoc.getPageCount();
             
-            // --- PASS 1: THE SCOUT ---
-            let tocText = "";
+            // --- PASS 1: THE SCOUT (Header Sampling) ---
+            let headerMap = "";
+            let consolidatedPages: number[] = [];
             try {
               const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer, verbosity: 0 });
               const pdf = await loadingTask.promise;
-              const scanLimit = Math.min(15, totalPages);
-              for (let p = 1; p <= scanLimit; p++) {
+              
+              // Sample EVERY page (header only) to find deep sections
+              for (let p = 1; p <= totalPages; p++) {
                 const page = await pdf.getPage(p);
                 const textContent = await page.getTextContent();
-                tocText += `--- Page ${p} ---\n` + textContent.items.map((item: any) => item.str).join(" ") + "\n";
+                const pageText = textContent.items.map((item: any) => item.str).join(" ");
+                const header = pageText.slice(0, 200); // 200 character header sample
+                
+                headerMap += `Page ${p}: ${header}\n`;
+                
+                // Early fallback detection for important keywords
+                if (header.toLowerCase().includes("consolidated")) {
+                  consolidatedPages.push(p - 1);
+                }
               }
             } catch (textErr) {
               console.warn("Local text extraction blocked, skipping scout", textErr);
@@ -181,12 +191,17 @@ export default function App() {
             let scoutDebug = "";
 
             // Only run the AI Scout if we successfully extracted local text
-            if (tocText.trim().length > 50) {
-              const scoutPrompt = `Review this Table of Contents/Intro text from a financial report. 
-              Identify the exact page numbers for: MD&A, Income Statement, Balance Sheet, Cash Flow, and Segment/Financial Notes.
-              RETURN ONLY A JSON OBJECT: {"pages": [1, 2, 3, 4], "sections": ["MD&A", "Balance Sheet"]}.
-              Use the exact page numbers written in the text. DO NOT modify or subtract 1 from the numbers.
-              TEXT: ${tocText}`;
+            if (headerMap.trim().length > 50) {
+              const scoutPrompt = `Analyze this map of page headers from an annual report. 
+              Identify the exact page numbers for: 
+              1. Consolidated Income Statement
+              2. Balance Sheet
+              3. Cash Flow Statement
+              4. Segment Reporting/Notes
+              
+              RETURN ONLY A JSON OBJECT: {"pages": [list of unique page numbers], "sections": ["found names"]}. 
+              Be exact. Use the page numbers as provided in the map.
+              MAP: ${headerMap.slice(0, 30000)}`;
 
               try {
                 const scoutResponse = await ai.models.generateContent({
@@ -195,28 +210,32 @@ export default function App() {
                 });
 
                 scoutDebug = scoutResponse.text.replace(/```json|```/g, "").trim();
-                const scoutResult = JSON.parse(scoutDebug);
-                
-                // Convert 1-indexed (from AI) to 0-indexed (for pdf-lib) safely in JS
-                targetPages = [...new Set(scoutResult.pages as number[])]
-                  .map(p => p - 1) 
-                  .filter(p => p >= 0 && p < totalPages)
-                  .sort((a, b) => a - b);
-                foundSections = scoutResult.sections || [];
+                const scoutJsonMatch = scoutDebug.match(/\{[\s\S]*\}/);
+                if (scoutJsonMatch) {
+                  const scoutResult = JSON.parse(scoutJsonMatch[0]);
+                  // Convert 1-indexed (from AI) to 0-indexed (for pdf-lib) safely
+                  targetPages = [...new Set(scoutResult.pages as number[])]
+                    .map(p => p - 1) 
+                    .filter(p => p >= 0 && p < totalPages)
+                    .sort((a, b) => a - b);
+                  foundSections = scoutResult.sections || [];
+                }
               } catch (e) {
                 console.warn("Scout parse failed, falling back", e);
               }
             }
 
-            // --- PASS 2: TARGETED EXTRACTION ---
-            const newDoc = await PDFDocument.create();
-            
-            // Fallback: If scout found nothing, default to first 15 pages
+            // --- FAILSAFE ASSEMBLY ---
+            // If scout found nothing, default to pages [0, 1, 2] AND any detected "Consolidated" pages
             if (targetPages.length === 0) {
-                targetPages = Array.from({ length: Math.min(15, totalPages) }, (_, i) => i);
-                foundSections = ["Manual Triage Fallback (P1-15)"];
+                targetPages = [...new Set([0, 1, 2, ...consolidatedPages])]
+                  .filter(p => p < totalPages)
+                  .sort((a, b) => a - b);
+                foundSections = ["Structural Fallback (P1-3 + Consolidated)"];
             }
 
+            // --- PASS 2: TARGETED EXTRACTION ---
+            const newDoc = await PDFDocument.create();
             const copiedPages = await newDoc.copyPages(srcDoc, targetPages);
             copiedPages.forEach(p => newDoc.addPage(p));
             const finalBuffer = await newDoc.save();
@@ -228,9 +247,10 @@ export default function App() {
             const deepPrompt = `Extract high-fidelity financial data from the attached pages.
             RULES:
             1. Start with YAML (ticker, company_name, doc_date, doc_type, extraction_confidence).
-            2. Convert all financial tables to strict GFM Markdown tables. Do not summarize tables.
-            3. Focus on MD&A insights and Segment Reporting details.
-            4. Output ONLY Markdown.`;
+            2. Convert all financial tables to strict GFM Markdown tables. 
+            3. DO NOT truncate tables. If a table spans multiple pages, reconstruct it as a single continuous Markdown table.
+            4. Focus on MD&A insights and Segment Reporting details.
+            5. Output ONLY Markdown.`;
 
             const response = await ai.models.generateContent({
               model: AI_MODEL,
@@ -240,7 +260,7 @@ export default function App() {
               ] }]
             });
 
-            const metadata = `\n\n> **Extraction Strategy**: Targeted Anchor-Driven\n> **Pages Processed**: ${targetPages.length} out of ${totalPages}\n> **Sections Located**: ${foundSections.join(", ")}\n> **Scout Debug JSON**: \`${scoutDebug}\`\n\n`;
+            const metadata = `\n\n> **Extraction Strategy**: Targeted Anchor-Driven\n> **Pages Processed**: ${targetPages.length} out of ${totalPages}\n> **Sections Located**: ${foundSections.join(", ")}\n\n`;
             extractedContent = (response.text || "No content extracted") + metadata;
 
             // Usage Tracking
